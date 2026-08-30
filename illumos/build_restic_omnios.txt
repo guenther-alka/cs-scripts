@@ -1,0 +1,20 @@
+#Compile Restic 0. 18.1 (newest) backup tool manually
+
+1. install go (extra repository)
+
+pkg install go-126
+
+2. Download and extract the latest master branch
+
+curl -L https://github.com/restic/restic/archive/refs/heads/master.zip -o restic.zip
+
+# Extract the archive
+unzip restic.zip
+cd restic-master
+
+3. create restic
+go run build.go
+
+test it:
+root@omnios:~/restic-master# ./restic version
+restic 0.18.1-dev (compiled manually) compiled with go1.26.1 on illumos/amd64

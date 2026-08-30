@@ -1,0 +1,3 @@
+#rem defaults too low for rustfs
+ipadm set-prop -p max_buf=4194304 tcp
+ipadm set-prop -p max_buf=4194304 udp
