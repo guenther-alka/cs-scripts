@@ -14,6 +14,9 @@ illumos/
   rustfs_omnios_1a.sh          # RustFS build on OmniOS/illumos (canonical;
                                # history of the 2a5..2a12 line in its header)
   cs-imageindex_omnios_1a.sh   # cs-imageindex build on OmniOS/illumos
+  build_llamacpp_omnios.sh     # llama.cpp llama-server on OmniOS -- OpenAI-
+                               # compatible local LLM (10 illumos patches,
+                               # verified on r151058)
   build.rc.sh                  # cargo install rustfs-cli + ipadm buffer fix
   needed_ip_modification_for_rustfs.txt
   build_restic_omnios.txt      # manual restic build notes (Go) on OmniOS
