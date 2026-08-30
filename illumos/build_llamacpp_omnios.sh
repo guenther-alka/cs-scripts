@@ -26,6 +26,9 @@
 #   bash ./build_llamacpp_omnios.sh
 # Result: /root/llama-server  (dynamic libs in /root/llama.cpp/build/bin,
 # linked via the binary's rpath)
+#
+# Runs on a FRESH OmniOS r151058: the toolchain (gcc14, cmake, git, curl,
+# gmake) is auto-installed via pkg if missing.
 # ============================================================================
 set -e
 set -o pipefail
@@ -33,9 +36,23 @@ if [ -z "${BASH_VERSION:-}" ]; then
     echo "ERROR: run with bash:  bash $0"; exit 1
 fi
 
-# ---- 0. prerequisites -----------------------------------------------------
-for c in git cmake gcc g++ curl; do
-    command -v "$c" >/dev/null 2>&1 || { echo "missing: $c"; exit 1; }
+# ---- 0. prerequisites (auto-install on a fresh OmniOS) --------------------
+# OmniOS package names for the build chain (r151058):
+#   gcc/g++ -> developer/gcc14      cmake -> ooce/developer/cmake
+#   git     -> developer/versioning/git   curl -> web/curl
+#   gmake   -> developer/build/gnu-make   (ninja -> ooce/developer/ninja)
+PKG_MAP="git=developer/versioning/git
+curl=web/curl
+cmake=ooce/developer/cmake
+gcc=developer/gcc14
+g++=developer/gcc14"
+for pair in $PKG_MAP; do
+    cmd="${pair%%=*}"
+    pkgname="${pair##*=}"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "installing $pkgname (provides $cmd) ..."
+        pkg install --accept "$pkgname" || { echo "ERROR: pkg install $pkgname failed"; exit 1; }
+    fi
 done
 # illumos make is NOT GNU make -> CMake-generated files fail; need ninja or gmake
 if command -v ninja >/dev/null 2>&1; then
@@ -43,7 +60,9 @@ if command -v ninja >/dev/null 2>&1; then
 elif command -v gmake >/dev/null 2>&1; then
     GEN=(-DCMAKE_MAKE_PROGRAM=/usr/bin/gmake)
 else
-    echo "need ninja or gmake:  pkg install ooce/developer/ninja  (or developer/gmake)"; exit 1
+    echo "installing gmake (GNU make for CMake) ..."
+    pkg install --accept developer/build/gnu-make || { echo "ERROR: pkg install gmake failed"; exit 1; }
+    GEN=(-DCMAKE_MAKE_PROGRAM=/usr/bin/gmake)
 fi
 
 BUILD_DIR="/root/llama.cpp"
