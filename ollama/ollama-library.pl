@@ -88,6 +88,7 @@ GetOptions(
     'size-max=f' => \$opt{size_max},
     'cache=i'    => \$opt{cache},
     'refresh'    => \$opt{refresh},
+    'cached-only'=> \$opt{cached_only},
     'timeout=i'  => \$opt{timeout},
     'max-models=i' => \$opt{max_models},
     'version'    => \$opt{version},
@@ -111,6 +112,8 @@ Usage:
   --cache SECS                cache TTL (0 = never expire, manual rebuild
                               only; default 2592000 = 30 days)
   --refresh                   rebuild the catalog (ignore cache)
+  --cached-only               never build -- return the cache or empty
+                              (GUI triggers rebuilds in the background)
   --version                   print the contract name
 HELP
 
@@ -126,11 +129,17 @@ if (!$opt{refresh} && !$opt{list} && -f $cache_file && cache_fresh($cache_file, 
 }
 
 if (!@$records) {
-    $opt{cached} = 0;
-    $records = $opt{list} ? build_model_list() : build_full_catalog();
-    if (!$opt{list} && @$records) {
-        make_path(dirname($cache_file)) unless -d dirname($cache_file);
-        write_json_file($cache_file, { contract => $CONTRACT, built => time(), records => $records });
+    if ($opt{cached_only}) {
+        # --cached-only: never build here (the GUI triggers a background
+        # rebuild). Return empty records so the caller shows "not built yet".
+        $opt{cached} = 0;
+    } else {
+        $opt{cached} = 0;
+        $records = $opt{list} ? build_model_list() : build_full_catalog();
+        if (!$opt{list} && @$records) {
+            make_path(dirname($cache_file)) unless -d dirname($cache_file);
+            write_json_file($cache_file, { contract => $CONTRACT, built => time(), records => $records });
+        }
     }
 }
 
