@@ -29,6 +29,7 @@
 #    { "contract": "cs-ollama-catalog-v1",
 #      "count": N,
 #      "cached": 0|1,
+#      "built": 1788091745,             # epoch of the catalog cache (0 if none)
 #      "records": [ {
 #        "model":   "llama3.2-vision",     # model family name
 #        "tag":     "llama3.2-vision:11b-instruct-q4_K_M",
@@ -107,7 +108,8 @@ Usage:
   --newer MONTHS              only updated within MONTHS (approximate)
   --param-max B               only <= B billion parameters
   --size-max GB               only <= GB download size
-  --cache SECS                catalog cache TTL (default 2592000 = 30 days)
+  --cache SECS                cache TTL (0 = never expire, manual rebuild
+                              only; default 2592000 = 30 days)
   --refresh                   rebuild the catalog (ignore cache)
   --version                   print the contract name
 HELP
@@ -161,8 +163,10 @@ if ($opt{tsv}) {
             $r->{age_days} // ''), "\n";
     }
 } else {
+    my $built = 0;
+    if (-f $cache_file) { my @st = stat($cache_file); $built = $st[9] || 0; }
     print encode_json({ contract => $CONTRACT, count => scalar(@recs),
-        cached => $opt{cached} ? 1 : 0, records => \@recs }), "\n";
+        cached => $opt{cached} ? 1 : 0, built => $built, records => \@recs }), "\n";
 }
 exit 0;
 
@@ -175,7 +179,9 @@ sub cache_file {
 sub cache_fresh {
     my ($f, $ttl) = @_;
     my @st = stat($f);
-    return @st && (time() - $st[9]) <= $ttl;
+    return 0 unless @st;          # no cache file yet
+    return 1 if $ttl == 0;        # --cache 0 = never expire (manual --refresh only)
+    return (time() - $st[9]) <= $ttl;
 }
 sub read_json_file {
     my ($f) = @_;
