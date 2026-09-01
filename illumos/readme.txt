@@ -1,208 +1,204 @@
 ==========================================================================
- readme.txt -- illumos/ Build- und Hilfsskripte
- (c) 2026 Guenther Alka / napp-it.org -- Projekt: napp-it cs
+ readme.txt -- illumos/ build and helper scripts
+ (c) 2026 Guenther Alka / napp-it.org -- Project: napp-it cs
 ==========================================================================
 
-Dieser Ordner enthaelt Build- und Hilfsskripte fuer die napp-it cs
-Werkzeuge auf OmniOS / illumos. Fuer illumos existieren fuer diese
-Werkzeuge KEINE vorgefertigten Binaries -- jedes Skript baut das jeweilige
-Werkzeug aus dem Quellcode und (wo sinnvoll) verpackt es in ein
-eigenstaendiges Release-Archiv. Das Gegenstueck fuer Oracle Solaris liegt
-im Nachbarordner solaris/.
+This folder holds build and helper scripts for the napp-it cs tools on
+OmniOS / illumos. There are NO prebuilt binaries for these tools on
+illumos -- each script builds the respective tool from source and (where
+useful) packages it into a self-contained release archive. The Oracle
+Solaris counterpart lives in the neighboring solaris/ folder.
 
-Alle Skripte sind fuer BASH geschrieben:  bash <skript>.sh
-(nicht "sh" -- die Skripte pruefen das selbst und brechen sonst mit
-"Run with bash" ab.)
+All scripts are written for BASH:  bash <script>.sh
+(not "sh" -- the scripts check this themselves and abort with
+"Run with bash" otherwise.)
 
-Inhalt im Ueberblick:
+Contents at a glance:
 
-  rustfs_omnios_1a.sh                 RustFS-Server (S3-Daemon) bauen
-  cs-imageindex_omnios_1a.sh          cs-imageindex (Media-Indexer) bauen + verpacken
-  build_llamacpp_omnios.sh            llama.cpp llama-server bauen (lokale LLM-Inferenz)
-  build.rc.sh                         rustfs-cli installieren/aktualisieren
-  build_restic_omnios.txt             Manuelle Notizen: restic kompilieren
-  needed_ip_modification_for_rustfs.txt  TCP/UDP-Puffergroessen fuer rustfs anheben
+  rustfs_omnios_1a.sh                 Build the RustFS server (S3 daemon)
+  cs-imageindex_omnios_1a.sh          Build + package cs-imageindex (media indexer)
+  build_llamacpp_omnios.sh            Build llama.cpp llama-server (local LLM inference)
+  build.rc.sh                         Install/update the rustfs-cli
+  build_restic_omnios.txt             Manual notes: compiling restic
+  needed_ip_modification_for_rustfs.txt  Raise TCP/UDP buffer sizes for rustfs
 
 ==========================================================================
  rustfs_omnios_1a.sh
 ==========================================================================
-Zweck:
-  Baut den RustFS-Server aus dem main-Branch von GitHub fuer
-  OmniOS/illumos. RustFS ist der S3-kompatible Speicher-Daemon der
-  napp-it cs S3-Dienste.
+Purpose:
+  Builds the RustFS server from the main branch on GitHub for
+  OmniOS/illumos. RustFS is the S3-compatible storage daemon behind the
+  napp-it cs S3 services.
 
-  Das Skript wendet automatisch alle fuer illumos noetigen
-  Quellcode-Anpassungen an:
-    - aws-lc-rs durch ring ersetzt (6 Abhaengigkeiten)
-    - pprof / pyroscope / jemalloc_pprof / mimalloc deaktiviert
-    - brotli alloc-no-stdlib 2.0 -> 3.0 (Duplikat-Konflikt) via
+  The script automatically applies all illumos-specific source changes
+  needed:
+    - aws-lc-rs replaced with ring (6 dependencies)
+    - pprof / pyroscope / jemalloc_pprof / mimalloc disabled
+    - brotli alloc-no-stdlib 2.0 -> 3.0 (duplicate conflict) via
       [patch.crates-io]
     - allocator_reclaim.rs / memory_observability.rs: illumos no-op
-      fuer die libmimalloc_sys-Aufrufe
-    - main.rs: mimalloc global_allocator entfernt, init_from_env() fix
-    - profiling.rs: keine Stubs (unsupported_impl ist bereits exportiert)
+      for the libmimalloc_sys calls
+    - main.rs: mimalloc global_allocator removed, init_from_env() fix
+    - profiling.rs: no stubs needed (unsupported_impl is already exported)
 
-  Dies ist das kanonische Skript (Nachfolger der Linie 2a5..2a12; die
-  vollstaendige Aenderungshistorie steht im Kopf des Skripts).
+  This is the canonical script (successor to the 2a5..2a12 line; the
+  full change history is in the script's header).
 
-Gebrauch:
+Usage:
   bash ./rustfs_omnios_1a.sh
 
-Voraussetzungen:
-  - OmniOS mit moeglichst >= 16 GB RAM und mindestens ~40 GB freiem
-    Plattenplatz auf dem rpool. Weniger RAM/Plattenplatz wird vom
-    Skript selbst abgefedert (siehe Schritt 3 und Schritt 13 unten) --
-    es ist keine manuelle Vorbereitung noetig, aber ein sehr enger Pool
-    (< ~9 GB frei) fuehrt nur zu einer Warnung, nicht zu einem Abbruch,
-    und der Build kann dann an OOM scheitern.
-  - System-Rust via pkg (OOCE developer/rust, >= 1.97). Eine veraltete
-    rustup-Toolchain aus einem frueheren Build wird automatisch entfernt.
+Requirements:
+  - OmniOS, ideally with >= 16 GB RAM and at least ~40 GB free disk
+    space on the rpool. Less RAM/disk space is cushioned by the script
+    itself (see step 3 and step 13 below) -- no manual preparation is
+    needed, but a very tight pool (< ~9 GB free) only produces a
+    warning, not an abort, and the build can then fail with OOM.
+  - System Rust via pkg (OOCE developer/rust, >= 1.97). A stale rustup
+    toolchain from an earlier build is removed automatically.
   - bash
 
-Ablauf (13 Schritte):
-  1.  Systempakete installieren (inkl. protoc fuer Pulsar-Protobuf-Codegen)
-  2.  Rust >= 1.96 sicherstellen (ggf. rustup-Installation)
-  3.  Swap pruefen/ergaenzen, falls gesamt < 6 GB (siehe unten)
-  4.  Altes Build-Verzeichnis loeschen, frisch von main klonen
-  5.  .cargo/config.toml (illumos-Linker gcc) schreiben
-  6.  Workspace Cargo.toml patchen
-  7.  rustfs/Cargo.toml patchen
-  8.  crates/obs/Cargo.toml patchen
-  9.  cargo fetch (Cargo.lock neu aufloesen)
-  10. brotli lokal patchen (alloc-no-stdlib Duplikat-Konflikt)
-  11. Rust-Quelldateien patchen (main.rs, allocator_reclaim.rs,
-      memory_observability.rs, profiling.rs -- siehe Liste oben)
-  12. RustFS-Console-ZIP herunterladen und nach rustfs/static/ entpacken
-  13. Release-Build (siehe unten)
-  Danach werden die Startanweisungen ausgegeben.
+Steps (13 total):
+  1.  Install system packages (incl. protoc for Pulsar's protobuf codegen)
+  2.  Ensure Rust >= 1.96 (rustup install if needed)
+  3.  Check/top up swap if total < 6 GB (see below)
+  4.  Delete the old build directory, clone fresh from main
+  5.  Write .cargo/config.toml (illumos linker: gcc)
+  6.  Patch the workspace Cargo.toml
+  7.  Patch rustfs/Cargo.toml
+  8.  Patch crates/obs/Cargo.toml
+  9.  cargo fetch (re-resolve Cargo.lock)
+  10. Patch brotli locally (alloc-no-stdlib duplicate conflict)
+  11. Patch Rust source files (main.rs, allocator_reclaim.rs,
+      memory_observability.rs, profiling.rs -- see the list above)
+  12. Download the RustFS Console ZIP and unpack it into rustfs/static/
+  13. Release build (see below)
+  Startup instructions are printed afterwards.
 
-  Schritt 3 -- dynamische Swap-Ergaenzung (seit 2026-08-09):
-    Statt einer festen Groesse (frueher "-V 8g", die auf knappen Pools
-    mit "out of space" scheiterte) berechnet das Skript nur so viel
-    zusaetzliches Swap-zvol (rpool/swap_build), wie zum Erreichen von
-    6 GB Gesamt-Swap fehlt, und prueft vorher den freien Platz auf dem
-    Pool (benoetigte Swap-Groesse + 3 GB Build-Headroom fuer target/
-    und das Cargo-Registry-Wachstum). Reicht der freie Platz nicht,
-    gibt das Skript nur eine WARNUNG aus und faehrt ohne zusaetzliches
-    Swap fort, statt mit "set -e" mitten im Lauf abzubrechen. Das
-    temporaere zvol wird ueber ein "trap ... EXIT" bei JEDEM
-    Skript-Ende automatisch wieder entfernt (Erfolg, Fehler oder
-    Ctrl-C) -- es bleibt also kein GB-grosses zvol dauerhaft auf dem
-    Pool zurueck.
+  Step 3 -- dynamic swap top-up (since 2026-08-09):
+    Instead of a fixed size (previously "-V 8g", which failed with
+    "out of space" on a tight pool), the script only adds as much extra
+    swap zvol (rpool/swap_build) as is needed to reach 6 GB total swap,
+    and checks free pool space first (the needed swap size plus 3 GB of
+    build headroom for target/ and cargo registry growth). If there
+    isn't enough free space, the script prints a WARNING and continues
+    without extra swap instead of aborting mid-run under "set -e". The
+    temporary zvol is removed automatically on ANY script exit via a
+    "trap ... EXIT" (success, error, or Ctrl-C) -- so no multi-GB zvol
+    is left behind on the pool permanently.
 
-  Schritt 13 -- codegen-units-Override (seit 2026-08-09):
-    Das Skript setzt beim Release-Build IMMER (nicht optional/manuell)
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16, um den Speicherbedarf des
-    Linker-Laufs zu senken (Workspace-Default ist codegen-units=1, was
-    beim rustfs-Bin-Crate auf einer 14-GB-RAM-Maschine rustc auf ~9 GB
-    RSS trieb und den fork() fuer den gcc-Linker unter illumos'
-    striktem Swap-Backing-Modell scheitern liess: "Not enough space").
-    Mit 16 Einheiten sinkt die Spitzenlast auf ~5,4 GB -- ein kleiner
-    Laufzeit-Performance-Kompromiss gegenueber dem Upstream-Default.
+  Step 13 -- codegen-units override (since 2026-08-09):
+    The script ALWAYS (not optionally/manually) sets
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 for the release build, to
+    lower the linker step's memory footprint (the workspace default is
+    codegen-units=1, which drove rustc to ~9 GB RSS for the rustfs bin
+    crate on a 14 GB RAM machine, and illumos' strict swap-backing model
+    for fork() then made forking off the gcc linker fail outright:
+    "Not enough space"). With 16 units, peak RSS drops to ~5.4 GB -- a
+    minor runtime performance trade-off versus the upstream default.
 
-Ergebnis:
-  RustFS-Binary unter target/release/ im Build-Verzeichnis
-  (/root/rustfs bei Standardvorgaben).
+Result:
+  RustFS binary under target/release/ in the build directory
+  (/root/rustfs with default settings).
 
 ==========================================================================
  cs-imageindex_omnios_1a.sh
 ==========================================================================
-Zweck:
-  Baut cs-imageindex (den Media-/Bild-Indexer der napp-it cs GUI) aus dem
-  Quellcode von github.com/guenther-alka/cs-imageindex und verpackt ein
-  vollstaendig eigenstaendiges Release-Archiv.
+Purpose:
+  Builds cs-imageindex (the media/image indexer for the napp-it cs GUI)
+  from source at github.com/guenther-alka/cs-imageindex and packages a
+  fully self-contained release archive.
 
-  HEIC/HEIF- und Video-Dekodierung laeuft ueber das MITgebaute statische
-  ffmpeg/ffprobe (ci/build-ffmpeg.sh aus dem Projekt, minimale statische
-  LGPL-Konfiguration) -- kein System-libheif, keine ooce-Pakete, kein
-  rpath/LD_LIBRARY_PATH-Basteln. Verifiziert auf OmniOS r151058j
-  (192.168.2.189) fuer v0.3.0.
+  HEIC/HEIF and video decoding goes through the co-built static
+  ffmpeg/ffprobe (ci/build-ffmpeg.sh from the project, minimal static
+  LGPL configuration) -- no system libheif, no ooce packages, no
+  rpath/LD_LIBRARY_PATH juggling. Verified on OmniOS r151058j
+  (192.168.2.189) for v0.3.0.
 
-Gebrauch:
+Usage:
   bash ./cs-imageindex_omnios_1a.sh
 
-Voraussetzungen:
-  - OmniOS, gcc, git, curl, protoc (werden bei Bedarf via pkg installiert)
-  - Rust >= 1.75 (sonst automatisch via rustup installiert)
-  - mindestens ~4 GB Swap empfohlen (unter 2 GB erscheint eine Warnung)
+Requirements:
+  - OmniOS, gcc, git, curl, protoc (installed via pkg on demand)
+  - Rust >= 1.75 (otherwise installed automatically via rustup)
+  - at least ~4 GB swap recommended (a warning appears below 2 GB)
 
-Ablauf (7 Schritte):
-  1.  Systempakete installieren (git, developer/rust, gcc, protoc)
-  2.  Rust-Version pruefen, ggf. rustup
-  3.  Swap-Check (nur Warnung, wenn < 2 GB)
-  4.  Altes Verzeichnis loeschen, frisch von
-      github.com/guenther-alka/cs-imageindex klonen
-  5.  .cargo/config.toml (illumos-Linker gcc) schreiben
+Steps (7 total):
+  1.  Install system packages (git, developer/rust, gcc, protoc)
+  2.  Check Rust version, rustup if needed
+  3.  Swap check (warning only if < 2 GB)
+  4.  Delete the old directory, clone fresh from
+      github.com/guenther-alka/cs-imageindex
+  5.  Write .cargo/config.toml (illumos linker: gcc)
   6.  cargo build --release
-  7.  ffmpeg/ffprobe bauen (ci/build-ffmpeg.sh) und das Archiv packen
+  7.  Build ffmpeg/ffprobe (ci/build-ffmpeg.sh) and package the archive
 
-Ergebnis:
-  ~/cs-imageindex-illumos.amd64.tar.gz  -- inhalt:
-    cs-imageindex, ffmpeg, ffprobe, models/ (onnx + Lizenzen), README,
+Result:
+  ~/cs-imageindex-illumos.amd64.tar.gz  -- contents:
+    cs-imageindex, ffmpeg, ffprobe, models/ (onnx + licenses), README,
     LICENCE + LICENCE-ffmpeg.txt
-  Upload z. B. via:  gh release upload <tag> ~/cs-imageindex-illumos.amd64.tar.gz
+  Upload e.g. via:  gh release upload <tag> ~/cs-imageindex-illumos.amd64.tar.gz
 
 ==========================================================================
  build_llamacpp_omnios.sh
 ==========================================================================
-Zweck:
-  Baut llama-server aus llama.cpp (OpenAI-kompatibler lokaler
-  Inferenz-Server fuer GGUF-Modelle) auf OmniOS/illumos.
+Purpose:
+  Builds llama-server from llama.cpp (an OpenAI-compatible local
+  inference server for GGUF models) on OmniOS/illumos.
 
-  llama.cpp/ggml hat KEINE offizielle illumos-Unterstuetzung -- das Skript
-  wendet die 10 live-verifizierten illumos-Patches automatisch an:
-    1.  src/llama-mmap.cpp        RLIMIT_MEMLOCK existiert nicht auf illumos
-    2.  vendor/miniaudio.h        C11 _Alignas ist in C++ ungueltig
-    3.  tools/mtmd/clip.cpp       pow(int,int) mehrdeutig
+  llama.cpp/ggml has NO official illumos support -- the script applies
+  the 10 live-verified illumos patches automatically:
+    1.  src/llama-mmap.cpp        RLIMIT_MEMLOCK does not exist on illumos
+    2.  vendor/miniaudio.h        C11 _Alignas is invalid in C++
+    3.  tools/mtmd/clip.cpp       pow(int,int) ambiguous
     4./5. common/arg.cpp + download.cpp  sys/syslimits.h -> sys/limits.h (__sun)
-    6.  common/common.cpp         cache/config-Verzeichnis-Guards (__sun)
-    7./8. common/common.cpp       pwd.h include + getpwuid-Guards (__sun)
-    9.  tools/mtmd/models/llava.cpp  sqrt(int64_t) mehrdeutig
+    6.  common/common.cpp         cache/config directory guards (__sun)
+    7./8. common/common.cpp       pwd.h include + getpwuid guards (__sun)
+    9.  tools/mtmd/models/llava.cpp  sqrt(int64_t) ambiguous
 
-  Verifiziert auf OmniOS r151058 (gcc 14.3, cmake 4.4, 4 Kerne,
-  2026-08-30): llama-server 0.3.0-dev beantwortet /v1/chat/completions
-  (getestet mit Qwen2.5-0.5B-Instruct-Q4_K_M).
+  Verified on OmniOS r151058 (gcc 14.3, cmake 4.4, 4 cores,
+  2026-08-30): llama-server 0.3.0-dev answers /v1/chat/completions
+  (tested with Qwen2.5-0.5B-Instruct-Q4_K_M).
 
-Gebrauch:
+Usage:
   bash ./build_llamacpp_omnios.sh
 
-Voraussetzungen:
-  - Frisches OmniOS (r151058 verifiziert). Die Toolchain
+Requirements:
+  - A fresh OmniOS install (r151058 verified). The toolchain
     (gcc14 = developer/gcc14, cmake = ooce/developer/cmake, git, curl,
-    gmake bzw. ninja) wird bei Bedarf automatisch via pkg installiert.
+    gmake or ninja) is installed automatically via pkg when needed.
 
-Ablauf:
-  1.  Toolchain-Sicherstellung (pkg install ...)
-  2.  git clone https://github.com/ggml-org/llama.cpp nach /root/llama.cpp
-  3.  illumos-Patches per sed (idempotent, kann mehrfach laufen)
-  4.  cmake konfigurieren (CPU-only, llama-server, keine Tests/App)
-  5.  bauen (parallel) und Binary nach /root/llama-server installieren
+Steps:
+  1.  Ensure the toolchain is present (pkg install ...)
+  2.  git clone https://github.com/ggml-org/llama.cpp into /root/llama.cpp
+  3.  Apply the illumos patches via sed (idempotent, can be re-run)
+  4.  Configure cmake (CPU-only, llama-server, no tests/app)
+  5.  Build (parallel) and install the binary to /root/llama-server
 
-Ergebnis:
-  /root/llama-server  (dynamische Libs unter /root/llama.cpp/build/bin,
-  verlinkt ueber das rpath des Binaries).
+Result:
+  /root/llama-server  (dynamic libs under /root/llama.cpp/build/bin,
+  linked via the binary's rpath).
 
 ==========================================================================
  build.rc.sh
 ==========================================================================
-Zweck:
-  Kleines Hilfsskript: installiert bzw. aktualisiert die rustfs-CLI
-  (rustfs-cli) aus crates.io via cargo.
+Purpose:
+  Small helper script: installs or updates the rustfs CLI (rustfs-cli)
+  from crates.io via cargo.
 
-Gebrauch:
+Usage:
   bash ./build.rc.sh
 
-Voraussetzungen:
-  - cargo im PATH (das Skript wechselt nach /root/.cargo/bin)
+Requirements:
+  - cargo on PATH (the script changes into /root/.cargo/bin)
 
 ==========================================================================
  build_restic_omnios.txt
 ==========================================================================
-Zweck:
-  Manuelle Bauanleitung (kein ausfuehrbares Skript) fuer das
-  Backup-Werkzeug restic 0.18.1 auf OmniOS.
+Purpose:
+  Manual build instructions (not an executable script) for the restic
+  0.18.1 backup tool on OmniOS.
 
-Gebrauch (Kurzfassung):
+Usage (short form):
   1. pkg install go-126
   2. curl -L https://github.com/restic/restic/archive/refs/heads/master.zip -o restic.zip
   3. unzip restic.zip && cd restic-master
@@ -213,26 +209,25 @@ Gebrauch (Kurzfassung):
 ==========================================================================
  needed_ip_modification_for_rustfs.txt
 ==========================================================================
-Zweck:
-  Manuelle Notiz: Die illumos-Standardwerte fuer die maximalen TCP/UDP-
-  Socket-Puffergroessen sind fuer rustfs zu klein. Vor der Inbetriebnahme
-  einmalig erhoehen:
+Purpose:
+  Manual note: illumos' default maximum TCP/UDP socket buffer sizes are
+  too small for rustfs. Raise them once before going into production:
 
     ipadm set-prop -p max_buf=4194304 tcp
     ipadm set-prop -p max_buf=4194304 udp
 
 ==========================================================================
- Aenderungshistorie dieser Datei
+ Change history of this file
 ==========================================================================
-2026-09-01  Umbenannt von _readme.txt zu readme.txt. Inhaltliche Korrektur:
-            rustfs_omnios_1a.sh Voraussetzungen -- die codegen-units-
-            Override (Schritt 13) ist KEINE manuelle Option fuer wenig
-            RAM, sondern wird vom Skript immer automatisch gesetzt.
-            Schrittliste 6.-12. praezisiert (statt Sammelgruppe einzeln
-            aufgefuehrt, "9. cargo fetch" ist kein Patch-Schritt). Neue
-            Absaetze zu Schritt 3 (dynamische Swap-Groesse + Cleanup-Trap)
-            und Schritt 13 (Grund/Wirkung der codegen-units-Override)
-            ergaenzt.
-2026-08-xx  Erstfassung (_readme.txt).
+2026-09-01  Translated German -> English (Gea: "alle docs und readme in
+            en").
+2026-09-01  Renamed from _readme.txt to readme.txt. Content fix: the
+            codegen-units override (step 13) in rustfs_omnios_1a.sh is
+            NOT a manual option for low-RAM systems -- the script always
+            sets it automatically. Step list tightened (13 steps listed
+            individually instead of a "6.-12." group). New paragraphs on
+            step 3 (dynamic swap sizing + EXIT-trap cleanup) and step 13
+            (rationale for the codegen-units override) added.
+2026-08-xx  First version (_readme.txt, German).
 
 ==========================================================================
