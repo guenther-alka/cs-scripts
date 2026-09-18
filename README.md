@@ -26,7 +26,33 @@ solaris/
 ollama/
   ollama-library.pl            # Ollama library catalog parser (see CONTRACT
                                # in the script header)
+benchmark/
+  benchmark.pl                 # standalone ZFS pool benchmark (pure Perl, no
+                               # fio needed; scratch dataset, 30 s steady
+                               # test, honest classes storage-bound|cache|
+                               # tool-limited) -- see benchmark/readme.txt
 ```
+
+## ZFS pool benchmark
+
+`benchmark/benchmark.pl` is a standalone pool benchmark for comparing pools
+("what does THIS pool really deliver?") on any ZFS host -- TrueNAS CORE/SCALE,
+FreeBSD, illumos/Solaris, OpenZFS on Linux and Windows. It needs only perl,
+zfs/zpool, df and optionally smartctl; the test medium is a scratch dataset
+that is created on the pool under test and destroyed again at the end.
+
+```sh
+perl benchmark/benchmark.pl profile=quick pool=tank            # about 1-2 min
+perl benchmark/benchmark.pl profile=mailserver syncwrite=yes load=balanced
+perl benchmark/benchmark.pl help=yes
+```
+
+The numbers are cache-safe by design: `primarycache=metadata` (data out of the
+ARC, metadata still cached), `sync=always` for the sync-write phase, a
+CONCURRENT `zpool iostat -v` sample per phase, and `recordsize=4K` for the 4k
+test file. Every result is tagged `storage-bound`, `cache`, `cache-influenced`
+or `tool-limited`, and the log ends with a `BENCH_DONE` marker. See
+`benchmark/readme.txt` for the details and the measured limitations.
 
 ## Ollama library parser
 
