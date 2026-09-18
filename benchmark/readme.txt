@@ -42,6 +42,27 @@ Limits (documented, not hidden)
   * A mirror already splits ONE read stream over both disks, so the 1-vs-N
     ratio is reported, never promised.
 
+Windows (measured 2026.09.18, OpenZFS on Windows zfswin-2.4.1rc15)
+  * zfs/zpool are called by plain name (the napp-it convention) and sit in the
+    MACHINE PATH after the OpenZFS install, so services find them as well.
+  * Datasets are NOT addressed by mountpoint there: that property stays unix
+    style ("/winpool") while the pool is mounted on a drive letter given by the
+    Windows-only property driveletter (ex. "d:").  A dataset path is therefore
+    <drive>:\<path below the pool root> -- the script resolves it that way;
+    using the mountpoint put the test file on the system drive instead.
+  * wmic no longer exists on current Windows -> RAM, free space and cpu_load use
+    PowerShell CIM / Get-PSDrive (the napp-it convention) with wmic as fallback.
+  * zfs create/set/destroy need ADMIN rights.  Without them the OpenZFS CLI
+    prints "permission denied / Attempting to relaunch command with
+    administrator privileges..." and may still create the dataset, so the script
+    asks ZFS whether the dataset exists instead of trusting that message.  Run
+    it elevated on Windows (the napp-it backend service is), otherwise the
+    folder fallback is used and the cache/sync properties do not apply.
+  * cmd.exe has no /dev/null: internally "2>NUL" is used (a "2>/dev/null" makes
+    cmd abort the whole command, which silently disabled the property probes and
+    the zpool sampler), and cleanup reads the directory instead of using glob()
+    (whose backslash escaping left the test files behind on Windows).
+
 Usage
   perl benchmark.pl profile=quick pool=tank
   perl benchmark.pl profile=mailserver syncwrite=yes load=balanced
