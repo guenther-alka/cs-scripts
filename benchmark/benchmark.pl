@@ -30,6 +30,16 @@
 #   and that one IDENTICAL IN CONTENT when changing either (the repo stores LF,
 #   a Windows checkout may show CRLF).
 #
+# WINDOWS NOTES
+#   Run it ELEVATED -- zfs create/set/destroy need admin rights.  The OpenZFS CLI
+#   self-elevates and may print "permission denied / Attempting to relaunch
+#   command with administrator privileges..."; without the rights the run falls
+#   back to a folder on the pool's drive and the cache/sync properties do NOT
+#   apply.  Datasets are addressed through the Windows-only property driveletter
+#   (mountpoint stays unix-style there, ex. "/winpool"), and RAM, free space and
+#   cpu_load come from PowerShell CIM / Get-PSDrive because wmic no longer exists
+#   on current Windows.
+#
 # FILES (all in the SAME directory this script was deployed to = member $tpath)
 #   benchmark_<runid>.par     parameters (written by the director, optional)
 #   last_benchmark.log        THE RESULT (truncated per run):
