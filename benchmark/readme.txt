@@ -62,4 +62,5 @@ Integration
   data/menues/_lib/scripts/bench/benchmark_worker.pl and is deployed to a
   cluster member by the benchmark menu (benchmark_director.pl + action.pl),
   which reads exactly the RESULT lines for its comparison table.
-  KEEP BOTH COPIES IDENTICAL when changing one.
+  KEEP BOTH COPIES IDENTICAL IN CONTENT when changing one -- the repository
+  stores LF, so a Windows checkout may show CRLF in the working copy.

@@ -27,7 +27,8 @@
 #   (override with rundir=/tmp), and only zfs/zpool/df/uptime/smartctl are used.
 #   This file is published from the cs-scripts repo as benchmark/benchmark.pl --
 #   keep the napp-it copy (data/menues/_lib/scripts/bench/benchmark_worker.pl)
-#   and that one identical when changing either.
+#   and that one IDENTICAL IN CONTENT when changing either (the repo stores LF,
+#   a Windows checkout may show CRLF).
 #
 # FILES (all in the SAME directory this script was deployed to = member $tpath)
 #   benchmark_<runid>.par     parameters (written by the director, optional)
@@ -66,7 +67,7 @@ use warnings;
 use English qw( -no_match_vars );
 use Time::HiRes qw(time);
 use Fcntl qw(O_WRONLY O_CREAT O_TRUNC);
-use File::Basename qw(dirname);
+use File::Basename qw(dirname basename);
 use File::Spec;
 use POSIX qw(strftime);
 
@@ -117,9 +118,10 @@ for my $a (@ARGV) {
 
 # ---- usage / help -----------------------------------------------------------
 if (($P{help} // '') =~ /^y/i) {
+    my $ME = basename($0);
     print <<"USAGE";
-benchmark_worker.pl -- ZFS pool benchmark, runs ON the machine under test.
-  usage:  perl benchmark_worker.pl [runid] [key=value ...]
+$ME -- ZFS pool benchmark, runs ON the machine under test.
+  usage:  perl $ME [runid] [key=value ...]
   keys:   profile=quick|basic|database|fileserver|mediaserver|mailserver|individual
           pool=<zpool>        (default: first pool of 'zpool list')
           streams=1|5|auto    (default auto, capped by the vCPU count)
