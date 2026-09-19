@@ -58,15 +58,20 @@ Windows (measured 2026.09.18, OpenZFS on Windows zfswin-2.4.1rc15)
     asks ZFS whether the dataset exists instead of trusting that message.  Run
     it elevated on Windows (the napp-it backend service is), otherwise the
     folder fallback is used and the cache/sync properties do not apply.
-  * cmd.exe has no /dev/null: internally "2>NUL" is used (a "2>/dev/null" makes
-    cmd abort the whole command, which silently disabled the property probes and
-    the zpool sampler), and cleanup reads the directory instead of using glob()
+  * cmd.exe has no /dev/null and backticks are NOT reliable in a console-less
+    worker (verified: the output can be empty), so all external commands run
+    through one funnel: Windows = cmd /c into a temp file which is read back,
+    Unix = plain backtick.  A "2>/dev/null" would make cmd.exe abort the command
+    entirely -- that silently disabled the property probes, the zpool sampler and
+    the SMART reads before.  Cleanup reads the directory instead of using glob()
     (whose backslash escaping left the test files behind on Windows).
 
 Usage
   perl benchmark.pl profile=quick pool=tank
   perl benchmark.pl profile=mailserver syncwrite=yes load=balanced
   perl benchmark.pl name_of_run profile=basic steady=yes steady_min=30
+  perl benchmark.pl check=yes pool=tank      # dry run: resolve env + medium,
+                                             # create nothing (frontend probe)
   perl benchmark.pl help=yes
 
   profile=quick ~1-2 min, the others 5-10 min.  Without a runid the id is
