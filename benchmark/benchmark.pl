@@ -877,14 +877,14 @@ if ($CHECK) {
          ? '_sys uses cmd /c + tmpfile (no backticks, safe for a console-less worker)'
          : '_sys uses backticks'));
     blog("check: vCPU=$VCPU RAM_GB=$RAM_GB threads=" . ($HAVE_THREADS ? 'yes' : 'no') . " streams=$STREAMS");
-    blog("check: zfs          = " . ($HAVE_ZFS ? ($one->('where zfs') || 'present (path n/a)') : 'n/a'));
-    blog("check: zpool        = " . ($HAVE_ZPOOL ? ($one->('where zpool') || 'present (path n/a)') : 'n/a'));
+    blog("check: zfs          = " . ($HAVE_ZFS ? ($one->($OSISWIN ? 'where zfs' : 'command -v zfs') || 'present (path n/a)') : 'n/a'));
+    blog("check: zpool        = " . ($HAVE_ZPOOL ? ($one->($OSISWIN ? 'where zpool' : 'command -v zpool') || 'present (path n/a)') : 'n/a'));
     blog("check: smartctl     = " . ($SMARTCTL =~ /\S/ ? $SMARTCTL : 'n/a'));
     blog("check: pools        = " . (join(',', @POOLS) || 'n/a'));
     blog("check: pool         = " . ($POOL =~ /\S/ ? $POOL : '(none -> folder)'));
     blog("check: media_kind   = " . (($HAVE_ZFS && $POOL =~ /\S/) ? "dataset $POOL/csbench_$RUNID" : 'folder'));
     blog("check: media_path   = " . _media_dir($mp));
-    blog("check: free_mb      = " . _free_mb(_media_dir($mp)));
+    blog("check: free_mb      = " . _free_mb($mp) . " (on $mp)");
     blog("check: rundir       = $TPATH");
     my $hc = (_sys("zfs get -H -o property primarycache $POOL") =~ /primarycache/) ? 'yes' : 'NO';
     my $hs = (_sys("zfs get -H -o property sync $POOL") =~ /\bsync\b/) ? 'yes' : 'NO';
