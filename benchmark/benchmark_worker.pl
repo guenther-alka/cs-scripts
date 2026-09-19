@@ -473,6 +473,8 @@ sub mk_media {
         $TESTDIR = _media_dir($base);
         mkdir $TESTDIR;
         $MEDIA_KIND = 'folder';
+        blog("bench_note: no zfs/pool -> FOLDER medium: sync=always and recordsize"
+           . " are NOT possible, the ZFS sync test is NOT valid for this run");
         return 1;
     }
 
@@ -494,6 +496,9 @@ sub mk_media {
     my $created = (_sys("zfs list -H -o name \"$DS\"") =~ /\S/) ? 1 : 0;
     unless ($created) {                       # really failed -> folder fallback
         blog("bench_note: zfs create failed -> folder fallback");
+        blog("bench_note: FOLDER medium: sync=always and recordsize are NOT possible,"
+           . " the ZFS sync test is NOT valid for this run"
+           . ($OSISWIN ? " (on Windows zfs create needs administrator rights)" : ''));
         my $mnt = $OSISWIN ? _win_ds_path($POOL)
                            : _norm_mnt(_sys("zfs get -H -o value mountpoint $POOL"));
         $mnt = ($OSISWIN ? ($ENV{TEMP} // 'C:\\Windows\\Temp') : '/tmp') unless $mnt =~ /\S/;
@@ -1087,6 +1092,12 @@ if (cancel_requested()) {
 bhdr('duration_s', sprintf('%.0f', $tot));
 unless ($HAVE_CACHE_PROP && $MEDIA_KIND eq 'dataset') {
     blog("bench_note: cache properties NOT applied -> read numbers may be cache-influenced");
+}
+if ($MEDIA_KIND ne 'dataset' || !$HAVE_SYNC_PROP) {
+    blog("bench_note: SYNC TEST INVALID -- media=$MEDIA_KIND, sync property="
+       . ($HAVE_SYNC_PROP ? 'yes' : 'NO') . ": sync=always cannot be set, so the"
+       . " sync-write phase measured a NORMAL write (use a scratch dataset, on"
+       . " Windows run the member elevated)");
 }
 for my $k (sort keys %CLASS) {
     blog(sprintf("bench_class: %-12s = %s", $k, $CLASS{$k}));
