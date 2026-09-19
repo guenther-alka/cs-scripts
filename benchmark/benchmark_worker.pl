@@ -680,12 +680,20 @@ sub _worker_read {
 sub _worker_write {
     my ($file, $dur, $bs, $cap) = @_;
     my $h = new_hist();
-    open(my $fh, '>>', $file) or return (0, 0, 0, 0, $h);   # opened, seeked below
+    # '+<' (READ/WRITE), never '>>': with O_APPEND the kernel ignores sysseek()
+    # and appends EVERY write, so the wrap-around below never happened and the
+    # "in-place" test file grew without limit (measured 2026.09.19 on Windows:
+    # a 256 MB file produced 2.3 GB in the pool and the 15 s async phase ran for
+    # minutes instead of ending).  make_testfile() creates the file first.
+    open(my $fh, '+<', $file) or return (0, 0, 0, 0, $h);
     binmode $fh;
     my $blk = 'W' x $bs;
     my $off = 0;
     my ($n, $bytes, $max) = (0, 0, 0);
     my $t0 = time();
+    # check the phase duration after EVERY large write (a time() call is nothing
+    # next to a 1 MB write); small blocks keep the cheap 64-iteration mask
+    my $mask = ($bs >= 262144) ? 0 : 0x3F;
     while (1) {
         my $s = time();
         sysseek($fh, $off, 0);
@@ -696,7 +704,7 @@ sub _worker_write {
         if (defined $w) { $bytes += $w; $n++; }
         $off += $bs;
         $off = 0 if $off >= $cap;      # wrap -> in-place overwrite, no growth
-        if (($n & 0x3F) == 0) { last if time() - $t0 >= $dur; }
+        if (($n & $mask) == 0) { last if time() - $t0 >= $dur; }
     }
     close $fh;
     return ($n, $bytes, time() - $t0, $max, $h);
@@ -799,7 +807,9 @@ sub make_testfile {
 # ---- steady write: per-interval sample lines + SMART + latency --------------
 sub steady_write {
     my ($file, $cap, $dur_s, $interval, $bs) = @_;
-    open(my $fh, '>>', $file) or return ();
+    # '+<' for the same reason as in _worker_write: '>>' (O_APPEND) would append
+    # every write and grow the file instead of overwriting it in place
+    open(my $fh, '+<', $file) or return ();
     binmode $fh;
     my $blk = 'S' x $bs;
     my $off = 0;
