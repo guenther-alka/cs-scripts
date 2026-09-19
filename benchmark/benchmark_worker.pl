@@ -353,6 +353,7 @@ sub _zpool_list {
 # =============================================================================
 my @POOLS = _zpool_list();
 my $DS     = '';
+my $DS_CREATED = 0;              # 1 = the scratch dataset really exists (destroy it!)
 my $TESTDIR = '';
 my $MEDIA_KIND = 'folder';
 my $HAVE_SYNC_PROP = 0;
@@ -508,8 +509,28 @@ sub mk_media {
         return 1;
     }
     # on Windows the mountpoint property is unusable (see _win_ds_path)
+    $DS_CREATED = 1;
     $TESTDIR = $OSISWIN ? _win_ds_path($DS)
                         : _norm_mnt(_sys("zfs get -H -o value mountpoint \"$DS\""));
+    # SAFETY NET: an empty/useless medium path must never become a RELATIVE path
+    # -- that would write into the worker's working directory and measure the
+    # wrong device.  This happens on Windows when the pool has NO drive letter
+    # (driveletter="-" -> _win_ds_path() returns "") or on Unix with
+    # mountpoint=legacy.  Fall back to the folder mode and say why; the dataset is
+    # still destroyed afterwards (rm_media uses $DS_CREATED).
+    unless ($TESTDIR =~ /\S/ && -d $TESTDIR) {
+        blog("bench_note: medium path NOT usable ('$TESTDIR') -> folder fallback"
+           . ($OSISWIN ? " -- check 'zfs get driveletter $POOL' (drive letter assigned?)" : ''));
+        blog("bench_note: FOLDER medium: sync=always and recordsize are NOT possible,"
+           . " the ZFS sync test is NOT valid for this run");
+        my $mnt2 = $OSISWIN ? _win_ds_path($POOL)
+                            : _norm_mnt(_sys("zfs get -H -o value mountpoint $POOL"));
+        $mnt2 = ($OSISWIN ? ($ENV{TEMP} // 'C:\\Windows\\Temp') : '/tmp') unless $mnt2 =~ /\S/;
+        $TESTDIR = _media_dir($mnt2);
+        mkdir $TESTDIR;
+        $MEDIA_KIND = 'folder';
+        return 1;
+    }
     $MEDIA_KIND = 'dataset';
     return 1;
 }
@@ -522,8 +543,8 @@ sub set_sync {
 }
 
 sub rm_media {
-    return unless $TESTDIR =~ /\S/;
-    if ($MEDIA_KIND eq 'dataset' && $DS =~ /\S/) {
+    return unless $TESTDIR =~ /\S/ || $DS_CREATED;
+    if ($DS_CREATED && $DS =~ /\S/) {         # created -> always destroy it again
         my $o = _sys("zfs destroy -rf \"$DS\"", 1);
         blog("bench_note: zfs destroy $DS -> " . ($o =~ /\S/ ? $o : 'ok'));
     }
@@ -889,7 +910,10 @@ if ($CHECK) {
     blog("check: pools        = " . (join(',', @POOLS) || 'n/a'));
     blog("check: pool         = " . ($POOL =~ /\S/ ? $POOL : '(none -> folder)'));
     blog("check: media_kind   = " . (($HAVE_ZFS && $POOL =~ /\S/) ? "dataset $POOL/csbench_$RUNID" : 'folder'));
-    blog("check: media_path   = " . _media_dir($mp));
+    blog("check: media_path   = " . _media_dir($mp) . ($OSISWIN
+         ? "   (driveletter '" . $one->("zfs get -H -o value driveletter $POOL")
+           . "' -> $mp" . (($mp =~ /^[A-Za-z]:/) ? '' : '  <-- NO DRIVE LETTER!') . ")"
+         : ''));
     blog("check: free_mb      = " . _free_mb($mp) . " (on $mp)");
     blog("check: rundir       = $TPATH");
     my $hc = (_sys("zfs get -H -o property primarycache $POOL") =~ /primarycache/) ? 'yes' : 'NO';
