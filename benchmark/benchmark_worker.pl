@@ -1048,6 +1048,7 @@ if ($T_SYNC && !cancel_requested()) {
     my ($r, $zs) = phase(kind => 'write', file => $file, dur => $C{sw}, bs => 1048576,
                          streams => 1, cap => $cap);
     bres('sync_write_singleuser', sprintf('%.1f', $r->{mbs}), 'MB/s');
+    bres('sync_write_iops',       sprintf('%.0f', $r->{iops}), 'iop/s');
     bres('sync_write_lat_p99_ms', sprintf('%.1f', $r->{p99} / 1000), 'ms');
     $CLASS{sync_write} = classify($r, $zs);
     bres('sync_write_class', $CLASS{sync_write}, '');
@@ -1060,6 +1061,7 @@ if ($T_ASYNC && !cancel_requested()) {
     my ($r, $zs) = phase(kind => 'write', file => $file, dur => $C{aw}, bs => 1048576,
                          streams => 1, cap => $cap);
     bres('async_write_singleuser', sprintf('%.1f', $r->{mbs}), 'MB/s (cache indicator)');
+    bres('async_write_iops',       sprintf('%.0f', $r->{iops}), 'iop/s');
     # async writes are absorbed by the dirty-data buffer; the vdev only sees the
     # later flush, so this must NOT be called storage-bound.  Compare it with the
     # sync number instead (measured on .50: 1358 async vs 136 sync MB/s).
