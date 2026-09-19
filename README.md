@@ -27,24 +27,28 @@ ollama/
   ollama-library.pl            # Ollama library catalog parser (see CONTRACT
                                # in the script header)
 benchmark/
-  benchmark.pl                 # standalone ZFS pool benchmark (pure Perl, no
+  benchmark_worker.pl          # standalone ZFS pool benchmark (pure Perl, no
                                # fio needed; scratch dataset, 30 s steady
                                # test, honest classes storage-bound|cache|
-                               # tool-limited) -- see benchmark/readme.txt
+                               # tool-limited) -- same file/name as the napp-it
+                               # worker; see benchmark/readme.txt
 ```
 
 ## ZFS pool benchmark
 
-`benchmark/benchmark.pl` is a standalone pool benchmark for comparing pools
-("what does THIS pool really deliver?") on any ZFS host -- TrueNAS CORE/SCALE,
-FreeBSD, illumos/Solaris, OpenZFS on Linux and Windows. It needs only perl,
-zfs/zpool, df and optionally smartctl; the test medium is a scratch dataset
-that is created on the pool under test and destroyed again at the end.
+`benchmark/benchmark_worker.pl` is a standalone pool benchmark for comparing
+pools ("what does THIS pool really deliver?") on any ZFS host -- TrueNAS
+CORE/SCALE, FreeBSD, illumos/Solaris, OpenZFS on Linux and Windows. It needs
+only perl, zfs/zpool, df and optionally smartctl; the test medium is a scratch
+dataset that is created on the pool under test and destroyed again at the end.
+It is the SAME file (name and content) as the napp-it worker shipped in
+`data/menues/_lib/scripts/bench/benchmark_worker.pl`.
 
 ```sh
-perl benchmark/benchmark.pl profile=quick pool=tank            # about 1-2 min
-perl benchmark/benchmark.pl profile=mailserver syncwrite=yes load=balanced
-perl benchmark/benchmark.pl help=yes
+perl benchmark/benchmark_worker.pl profile=quick pool=tank     # about 1-2 min
+perl benchmark/benchmark_worker.pl profile=mailserver syncwrite=yes load=balanced
+perl benchmark/benchmark_worker.pl check=yes pool=tank         # dry run, no I/O
+perl benchmark/benchmark_worker.pl help=yes
 ```
 
 The numbers are cache-safe by design: `primarycache=metadata` (data out of the

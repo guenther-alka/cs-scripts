@@ -26,10 +26,11 @@
 #   Without a runid argument the id is generated as auto_YYYYMMDD_HHMMSS (so the
 #   scratch dataset gets a valid name), the log/marker land next to THIS script
 #   (override with rundir=/tmp), and only zfs/zpool/df/uptime/smartctl are used.
-#   This file is published from the cs-scripts repo as benchmark/benchmark.pl --
-#   keep the napp-it copy (data/menues/_lib/scripts/bench/benchmark_worker.pl)
-#   and that one IDENTICAL IN CONTENT when changing either (the repo stores LF,
-#   a Windows checkout may show CRLF).
+#   This file is published from the cs-scripts repo as
+#   benchmark/benchmark_worker.pl -- SAME NAME, SAME CONTENT as the napp-it copy
+#   in data/menues/_lib/scripts/bench/benchmark_worker.pl.  Keep both byte for
+#   byte identical when changing either (the repo stores LF, a Windows checkout
+#   may show CRLF).
 #
 # WINDOWS NOTES
 #   Run it ELEVATED -- zfs create/set/destroy need admin rights.  The OpenZFS CLI

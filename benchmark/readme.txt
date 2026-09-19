@@ -3,7 +3,7 @@
  (c) 2026 Guenther Alka / napp-it.org -- Project: napp-it cs
 ==========================================================================
 
-benchmark.pl measures POOL performance on the machine it runs on. It needs
+benchmark_worker.pl measures POOL performance on the machine it runs on. It needs
 no napp-it installation, no frontend and no cluster -- only perl, zfs/zpool,
 df and (optionally) smartctl. Written in pure Perl (sysseek/sysread/syswrite
 + Time::HiRes): no fio, nothing to install.
@@ -67,12 +67,12 @@ Windows (measured 2026.09.18, OpenZFS on Windows zfswin-2.4.1rc15)
     (whose backslash escaping left the test files behind on Windows).
 
 Usage
-  perl benchmark.pl profile=quick pool=tank
-  perl benchmark.pl profile=mailserver syncwrite=yes load=balanced
-  perl benchmark.pl name_of_run profile=basic steady=yes steady_min=30
-  perl benchmark.pl check=yes pool=tank      # dry run: resolve env + medium,
-                                             # create nothing (frontend probe)
-  perl benchmark.pl help=yes
+  perl benchmark_worker.pl profile=quick pool=tank
+  perl benchmark_worker.pl profile=mailserver syncwrite=yes load=balanced
+  perl benchmark_worker.pl name_of_run profile=basic steady=yes steady_min=30
+  perl benchmark_worker.pl check=yes pool=tank   # dry run: resolve env + medium,
+                                                 # create nothing (frontend probe)
+  perl benchmark_worker.pl help=yes
 
   profile=quick ~1-2 min, the others 5-10 min.  Without a runid the id is
   generated as auto_YYYYMMDD_HHMMSS.  Result: last_benchmark.log next to the
@@ -84,9 +84,9 @@ Usage
   second run answer "already running".  Cancel: create benchmark_<runid>.cancel.
 
 Integration
-  The identical script ships in the napp-it cs distribution as
-  data/menues/_lib/scripts/bench/benchmark_worker.pl and is deployed to a
+  The SAME file (same name, same content) ships in the napp-it cs distribution
+  as data/menues/_lib/scripts/bench/benchmark_worker.pl and is deployed to a
   cluster member by the benchmark menu (benchmark_director.pl + action.pl),
   which reads exactly the RESULT lines for its comparison table.
-  KEEP BOTH COPIES IDENTICAL IN CONTENT when changing one -- the repository
-  stores LF, so a Windows checkout may show CRLF in the working copy.
+  KEEP BOTH COPIES IDENTICAL when changing one -- the repository stores LF, so a
+  Windows checkout may show CRLF in the working copy.
