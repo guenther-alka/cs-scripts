@@ -18,6 +18,7 @@
 #     four_k=yes|no   syncwrite=yes|no   mixed=yes|no   steady=yes|no
 #     steady_min=<minutes>             (default 30)
 #     rundir=<dir>                     (default: directory of this script)
+#     check=yes                        resolve env + test medium and exit (no I/O)
 #
 # STANDALONE USE -- no napp-it frontend required, e.g. on foreign hardware
 # (TrueNAS CORE/SCALE, plain FreeBSD, any ZFS host):
@@ -141,6 +142,7 @@ $ME -- ZFS pool benchmark, runs ON the machine under test.
           steady=yes|no   steady_min=30  steady_interval=30
           filesize_ram=<percent of RAM>   (honoured for profile=individual only)
           rundir=<dir>        (default: the directory this script lives in)
+check=yes           resolve environment + test medium and exit (NO I/O, no dataset)
           verbose=yes
   result: <rundir>/last_benchmark.log
           bench_hdr lines (all parameters) + RESULT lines + BENCH_DONE ok|error
@@ -177,11 +179,34 @@ unless (-d $TPATH && -w $TPATH) {
     }
 }
 
-# Portable "discard stderr": cmd.exe has no /dev/null, and there a "2>/dev/null"
-# makes cmd ABORT the whole command ("The system cannot find the path specified")
-# instead of just redirecting -- which silently disabled the property probes, the
-# zpool sampler and the SMART reads on Windows (measured 2026.09.18).
-my $NULLREDIR = $OSISWIN ? '2>NUL' : '2>/dev/null';
+# =============================================================================
+# COMMAND EXECUTION (one funnel for every external command)
+# =============================================================================
+# Backticks are NOT reliable inside a console-less Windows worker (windows.info
+# section 4, CONFIRMED live there: output can be EMPTY although the command is
+# valid) -- and this script is started detached by the director.  So on Windows
+# every command goes through cmd /c into a temp file which is read back (the
+# zfs_get_prop()/_zfs_get_prop() pattern of the other worker scripts).  On Unix
+# _sys() is a plain backtick, i.e. unchanged.  $merge keeps stderr (needed for
+# zfs create/set/destroy messages), otherwise stderr is discarded -- cmd.exe has
+# no /dev/null and ABORTS the whole command on a "2>/dev/null" (measured
+# 2026.09.18: that silently disabled the property probes, the zpool sampler and
+# the SMART reads on Windows).
+my $SYSN = 0;
+sub _sys {
+    my ($cmd, $merge) = @_;
+    if (!$OSISWIN) {
+        my $redir = $merge ? '2>&1' : '2>/dev/null';
+        return wantarray ? `$cmd $redir` : scalar `$cmd $redir`;
+    }
+    my $redir = $merge ? '2>&1' : '2>NUL';
+    my $tmp = File::Spec->catfile($TPATH, 'bench_cmd_' . $$ . '_' . (++$SYSN) . '.tmp');
+    system("cmd /c $cmd > \"$tmp\" $redir");
+    my @l = ();
+    if (open(my $fh, '<', $tmp)) { @l = <$fh>; close $fh; }
+    unlink $tmp;
+    return wantarray ? @l : join('', @l);
+}
 
 # ---- environment -------------------------------------------------------------
 sub _env_cpus {
@@ -191,10 +216,10 @@ sub _env_cpus {
         # order matters for foreign systems: nproc (Linux), sysctl hw.ncpu
         # (FreeBSD/macOS/TrueNAS CORE), psrinfo (Solaris/illumos),
         # getconf (last resort, POSIX).
-        $n = $1 if `nproc 2>/dev/null` =~ /^(\d+)/;
-        $n ||= $1 if `sysctl -n hw.ncpu 2>/dev/null` =~ /^(\d+)/;
-        $n ||= scalar(grep { /\S/ } `psrinfo 2>/dev/null`);
-        $n ||= $1 if `getconf _NPROCESSORS_ONLN 2>/dev/null` =~ /^(\d+)/;
+        $n = $1 if _sys("nproc") =~ /^(\d+)/;
+        $n ||= $1 if _sys("sysctl -n hw.ncpu") =~ /^(\d+)/;
+        $n ||= scalar(grep { /\S/ } _sys("psrinfo"));
+        $n ||= $1 if _sys("getconf _NPROCESSORS_ONLN") =~ /^(\d+)/;
     }
     return $n > 0 ? $n : 1;
 }
@@ -203,22 +228,22 @@ sub _env_ram_gb {
     if ($OSISWIN) {
         # wmic is gone on current Windows 11/Server builds -> PowerShell CIM is the
         # fallback (the napp-it convention, see monitor.pl/status.pl).  KB values.
-        my $g = (`wmic ComputerSystem get TotalPhysicalMemory 2>NUL`)[0] // '';
+        my $g = (_sys("wmic ComputerSystem get TotalPhysicalMemory"))[0] // '';
         $kb = int($1 / 1024) if $g =~ /(\d{6,})/;
         unless ($kb > 0) {
-            my $c = `powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize" 2>NUL`;
+            my $c = _sys("powershell -NoProfile -Command \"(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize\"");
             $kb = $1 if $c =~ /^\s*(\d{5,})/m;
         }
     } elsif ($OSNAME =~ /solaris|illumos/i) {
-        my $m = join('', grep { /Memory size/ } `prtconf 2>/dev/null`);
+        my $m = join('', grep { /Memory size/ } _sys("prtconf"));
         $kb = $1 * 1024 if $m =~ /Memory size:\s*(\d+)/;
     } elsif (-r '/proc/meminfo') {
-        my $m = (`grep MemTotal /proc/meminfo 2>/dev/null`)[0] // '';
+        my $m = (_sys("grep MemTotal /proc/meminfo"))[0] // '';
         $kb = $1 if $m =~ /MemTotal:\s*(\d+)/;
     } else {
         # FreeBSD/TrueNAS CORE/macOS: hw.physmem (bytes) / hw.memsize (macOS)
-        my $b = $1 if `sysctl -n hw.physmem 2>/dev/null` =~ /^(\d+)/;
-        $b ||= $1 if `sysctl -n hw.memsize 2>/dev/null` =~ /^(\d+)/;
+        my $b = $1 if _sys("sysctl -n hw.physmem") =~ /^(\d+)/;
+        $b ||= $1 if _sys("sysctl -n hw.memsize") =~ /^(\d+)/;
         $kb = int($b / 1024) if $b;
     }
     return $kb > 0 ? int($kb / 1048576) : 0;   # GB
@@ -261,6 +286,7 @@ my $T_MULTI   = (($P{multiuser}  // 'yes') =~ /^y/i) ? 1 : 0;
 my $T_STEADY  = (($P{steady}     // 'no')  =~ /^y/i) ? 1 : 0;
 my $STEADY_MIN = $P{steady_min} // 30;
 my $STEADY_IV  = $P{steady_interval} // 30;    # 30 s aggregation window (user spec)
+my $CHECK      = (($P{check}       // 'no')  =~ /^y/i) ? 1 : 0;   # dry run, no I/O
 
 my $POOL = $P{pool} // '';
 
@@ -311,13 +337,13 @@ sub find_smartctl {
 my $SMARTCTL = find_smartctl();
 
 # zfs/zpool are only used if actually present (plain drive letter / no ZFS)
-sub _have { my ($c) = @_; my $o = $OSISWIN ? `where $c 2>NUL` : `command -v $c 2>/dev/null`; return ($o =~ /\S/) ? 1 : 0; }
+sub _have { my ($c) = @_; my $o = $OSISWIN ? _sys("where $c") : _sys("command -v $c"); return ($o =~ /\S/) ? 1 : 0; }
 my $HAVE_ZFS   = _have('zfs');
 my $HAVE_ZPOOL = _have('zpool');
 
 sub _zpool_list {
     return () unless $HAVE_ZPOOL;
-    my @p = map { /^(\S+)/ ? $1 : () } `zpool list -H -o name $NULLREDIR`;
+    my @p = map { /^(\S+)/ ? $1 : () } _sys("zpool list -H -o name");
     return @p;
 }
 
@@ -338,7 +364,7 @@ my $CACHE_MODE = 'metadata';
 sub set_recordsize {
     my ($rs) = @_;
     return unless $MEDIA_KIND eq 'dataset';
-    my $o = `zfs set recordsize=$rs "$DS" 2>&1`;
+    my $o = _sys("zfs set recordsize=$rs \"$DS\"", 1);
     blog("bench_note: zfs set recordsize=$rs -> " . ($o =~ /\S/ ? $o : 'ok'));
 }
 
@@ -376,7 +402,7 @@ sub _win_ds_path {
     my $drv = '';
     for my $t ($ds, $POOL) {                 # pool root is the fallback ("-" case)
         next unless defined $t && $t =~ /\S/;
-        my $o = `zfs get -H -o value driveletter "$t" 2>NUL`;
+        my $o = _sys("zfs get -H -o value driveletter \"$t\"");
         $o =~ s/\s+//g;
         if ($o =~ /^([A-Za-z]):?$/) { $drv = uc($1) . ':'; last; }
     }
@@ -405,22 +431,22 @@ sub _free_mb {
         # medium is a dataset.  wmic is gone on current Windows, so PowerShell
         # (Get-PSDrive, the napp-it convention) is the fallback for drive letters.
         if ($MEDIA_KIND eq 'dataset' && $DS =~ /\S/) {
-            my $a = `zfs get -H -o value avail "$DS" 2>NUL`;
+            my $a = _sys("zfs get -H -o value avail \"$DS\"");
             $mb = _size_mb($a) if $a =~ /\S/;
         }
         if ($mb <= 0) {
             my ($dl) = $p =~ /^([A-Za-z]:)/;
             return 0 unless $dl;
-            my $o = `wmic logicaldisk where "DeviceID='$dl'" get FreeSpace 2>NUL`;
+            my $o = _sys("wmic logicaldisk where \"DeviceID='$dl'\" get FreeSpace");
             $mb = int($1 / 1048576) if $o =~ /(\d{7,})/;
             if ($mb <= 0) {
                 my $dn = $dl; $dn =~ s/:$//;
-                my $c = `powershell -NoProfile -Command "(Get-PSDrive -Name '$dn').Free" 2>NUL`;
+                my $c = _sys("powershell -NoProfile -Command \"(Get-PSDrive -Name '$dn').Free\"");
                 $mb = int($1 / 1048576) if $c =~ /(\d{7,})/;
             }
         }
     } else {
-        my $o = `df -Pk "$p" $NULLREDIR`;
+        my $o = _sys("df -Pk \"$p\"");
         $mb = $1 if $o =~ /^\S+\s+\d+\s+\d+\s+(\d+)/m;
     }
     return $mb;
@@ -452,23 +478,23 @@ sub mk_media {
     $DS = "$POOL/csbench_$RUNID";
     my @opts = ("-o", "compression=off", "-o", "atime=off");
     # probe the properties first: a ZFS build without them must not abort the run
-    $HAVE_CACHE_PROP = (`zfs get -H -o property primarycache $POOL $NULLREDIR` =~ /primarycache/) ? 1 : 0;
-    $HAVE_SYNC_PROP  = (`zfs get -H -o property sync $POOL $NULLREDIR` =~ /\bsync\b/) ? 1 : 0;
+    $HAVE_CACHE_PROP = (_sys("zfs get -H -o property primarycache $POOL") =~ /primarycache/) ? 1 : 0;
+    $HAVE_SYNC_PROP  = (_sys("zfs get -H -o property sync $POOL") =~ /\bsync\b/) ? 1 : 0;
     push @opts, ("-o", "primarycache=$cache_mode") if $HAVE_CACHE_PROP;
     push @opts, ("-o", "secondarycache=none")      if $HAVE_CACHE_PROP;
     push @opts, ("-o", "sync=$sync_mode")          if $HAVE_SYNC_PROP;
 
-    my $out = `zfs create @opts "$DS" 2>&1`;
+    my $out = _sys("zfs create @opts \"$DS\"", 1);
     blog("bench_note: zfs create -> " . ($out =~ /\S/ ? $out : 'ok'));
     # Do NOT decide by the message text: OpenZFS on Windows self-elevates and may
     # print "permission denied / Attempting to relaunch command with
     # administrator privileges..." while the dataset IS created (measured
     # 2026.09.18) -- and it failed the other way round for destroy.  Ask ZFS.
-    my $created = (`zfs list -H -o name "$DS" $NULLREDIR` =~ /\S/) ? 1 : 0;
+    my $created = (_sys("zfs list -H -o name \"$DS\"") =~ /\S/) ? 1 : 0;
     unless ($created) {                       # really failed -> folder fallback
         blog("bench_note: zfs create failed -> folder fallback");
         my $mnt = $OSISWIN ? _win_ds_path($POOL)
-                           : _norm_mnt(`zfs get -H -o value mountpoint $POOL $NULLREDIR`);
+                           : _norm_mnt(_sys("zfs get -H -o value mountpoint $POOL"));
         $mnt = ($OSISWIN ? ($ENV{TEMP} // 'C:\\Windows\\Temp') : '/tmp') unless $mnt =~ /\S/;
         $TESTDIR = _media_dir($mnt);
         mkdir $TESTDIR;
@@ -477,7 +503,7 @@ sub mk_media {
     }
     # on Windows the mountpoint property is unusable (see _win_ds_path)
     $TESTDIR = $OSISWIN ? _win_ds_path($DS)
-                        : _norm_mnt(`zfs get -H -o value mountpoint "$DS" $NULLREDIR`);
+                        : _norm_mnt(_sys("zfs get -H -o value mountpoint \"$DS\""));
     $MEDIA_KIND = 'dataset';
     return 1;
 }
@@ -485,14 +511,14 @@ sub mk_media {
 sub set_sync {
     my ($mode) = @_;
     return unless $MEDIA_KIND eq 'dataset' && $HAVE_SYNC_PROP;
-    my $o = `zfs set sync=$mode "$DS" 2>&1`;
+    my $o = _sys("zfs set sync=$mode \"$DS\"", 1);
     blog("bench_note: zfs set sync=$mode -> " . ($o =~ /\S/ ? $o : 'ok'));
 }
 
 sub rm_media {
     return unless $TESTDIR =~ /\S/;
     if ($MEDIA_KIND eq 'dataset' && $DS =~ /\S/) {
-        my $o = `zfs destroy -rf "$DS" 2>&1`;
+        my $o = _sys("zfs destroy -rf \"$DS\"", 1);
         blog("bench_note: zfs destroy $DS -> " . ($o =~ /\S/ ? $o : 'ok'));
     }
     # glob() treats "\" as an ESCAPE, so a Windows pattern like
@@ -518,7 +544,7 @@ sub zpool_sample {
     my ($dur) = @_;
     return 'n/a (no zpool)' unless $HAVE_ZPOOL && $POOL =~ /\S/;
     $dur = int($dur); $dur = 1 if $dur < 1;
-    my @o = grep { /\S/ } `zpool iostat -v $dur 2 $NULLREDIR`;
+    my @o = grep { /\S/ } _sys("zpool iostat -v $dur 2");
     return 'n/a' unless @o;
     my $start = 0;
     for my $i (0 .. $#o) { $start = $i if $o[$i] =~ /^\s*capacity/i; }   # last block
@@ -536,14 +562,14 @@ sub smart_snapshot {
     return "bench_smart: $label = n/a (no smartctl)" unless $SMARTCTL =~ /\S/;
     my $dev = '';
     if ($HAVE_ZPOOL && $POOL =~ /\S/) {
-        for my $l (`zpool status -P "$POOL" $NULLREDIR`) {
+        for my $l (_sys("zpool status -P \"$POOL\"")) {
             if ($OSISWIN) { $dev = $1 if $l =~ /(\\\\\.\\PhysicalDrive\d+)/; }
             else          { $dev = $1 if $l =~ m{(/dev/\S+)}; }
             last if $dev =~ /\S/;
         }
     }
     return "bench_smart: $label = n/a (no device found)" unless $dev =~ /\S/;
-    my @a = `"$SMARTCTL" -a "$dev" $NULLREDIR`;
+    my @a = _sys("\"$SMARTCTL\" -a \"$dev\"");
     return "bench_smart: $label = n/a (smartctl failed)" unless @a;
     my @keep = map { s/^\s+|\s+$//gr }
                grep { /(Temperature|Percentage Used|Data Units Written|Power On Hours)/i } @a;
@@ -555,13 +581,13 @@ sub cpu_load {
     if ($OSISWIN) {
         # neither wmic nor uptime exist on current Windows -> CIM (napp-it
         # convention, see monitor.pl/status.pl)
-        my $o = `powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average" $NULLREDIR`;
+        my $o = _sys("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average\"");
         return int($1) . '%' if $o =~ /(\d+(?:[.,]\d+)?)/;
         return 'n/a';
     }
     # 'uptime' works on Solaris/illumos/Linux/BSD/macOS and always gives a
     # defined value; the earlier prstat parse could return an undef $1.
-    my $j = join('', `uptime $NULLREDIR`);
+    my $j = join('', _sys("uptime"));
     return $1 if $j =~ /load average[s]?:\s*([\d.]+)/;
     return 'n/a';
 }
@@ -837,6 +863,37 @@ bhdr('phases',    join(',', grep { /\S/ } (
                     $T_MIXED ? "mixed:$C{mx}s" : '',
                     $T_MULTI ? "multiuser:$C{mu}s x$STREAMS" : '',
                     $T_STEADY ? "steady:${STEADY_MIN}min/${STEADY_IV}s" : '')));
+
+# =============================================================================
+# DRY CHECK (check=yes) -- resolve environment and test medium, create NOTHING
+# =============================================================================
+if ($CHECK) {
+    my $one = sub { my $o = _sys($_[0]); $o =~ s/[\r\n]+/ /g; $o =~ s/^\s+|\s+$//g; return $o; };
+    my $mp  = $OSISWIN ? _win_ds_path($POOL)
+                       : (($HAVE_ZFS && $POOL =~ /\S/) ? _norm_mnt(_sys("zfs get -H -o value mountpoint $POOL")) : '');
+    $mp = ($OSISWIN ? ($ENV{TEMP} // 'C:\\Windows\\Temp') : '/tmp') unless $mp =~ /\S/;
+    blog("check: perl         = $^V");
+    blog("check: os           = $OSNAME -- " . ($OSISWIN
+         ? '_sys uses cmd /c + tmpfile (no backticks, safe for a console-less worker)'
+         : '_sys uses backticks'));
+    blog("check: vCPU=$VCPU RAM_GB=$RAM_GB threads=" . ($HAVE_THREADS ? 'yes' : 'no') . " streams=$STREAMS");
+    blog("check: zfs          = " . ($HAVE_ZFS ? ($one->('where zfs') || 'present (path n/a)') : 'n/a'));
+    blog("check: zpool        = " . ($HAVE_ZPOOL ? ($one->('where zpool') || 'present (path n/a)') : 'n/a'));
+    blog("check: smartctl     = " . ($SMARTCTL =~ /\S/ ? $SMARTCTL : 'n/a'));
+    blog("check: pools        = " . (join(',', @POOLS) || 'n/a'));
+    blog("check: pool         = " . ($POOL =~ /\S/ ? $POOL : '(none -> folder)'));
+    blog("check: media_kind   = " . (($HAVE_ZFS && $POOL =~ /\S/) ? "dataset $POOL/csbench_$RUNID" : 'folder'));
+    blog("check: media_path   = " . _media_dir($mp));
+    blog("check: free_mb      = " . _free_mb(_media_dir($mp)));
+    blog("check: rundir       = $TPATH");
+    my $hc = (_sys("zfs get -H -o property primarycache $POOL") =~ /primarycache/) ? 'yes' : 'NO';
+    my $hs = (_sys("zfs get -H -o property sync $POOL") =~ /\bsync\b/) ? 'yes' : 'NO';
+    blog("check: props        = primarycache/secondarycache=$hc sync=$hs (probed on $POOL)");
+    blog("CHECK_DONE ok (nothing created, no I/O)");
+    print "CHECK_DONE ok (nothing created, no I/O)\n";
+    $DONE = 1;                       # no "aborted" line for a dry check
+    exit 0;
+}
 
 mk_media('standard');
 
