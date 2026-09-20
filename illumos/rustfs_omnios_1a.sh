@@ -209,16 +209,24 @@
 set -e
 set -o pipefail
 
-# Ephemeral build-swap cleanup: rpool/swap_build (step 3) is only meant to
-# exist for the duration of this build. Without this trap it accumulates
-# permanently (8G on a 31.5G pool == pool fills to 100% after a few runs,
-# as found on .189 2026-08-08). Runs on ANY exit (success, error, Ctrl-C).
-cleanup_build_swap() {
-    if zfs list rpool/swap_build >/dev/null 2>&1; then
-        echo "  -> Removing temporary build-swap (rpool/swap_build)..."
-        swap -d /dev/zvol/dsk/rpool/swap_build 2>/dev/null || true
-        zfs destroy rpool/swap_build 2>/dev/null || true
+# Ephemeral build-swap cleanup: the swap zvol of step 3 (<pool>/swap_build, on
+# rpool or on the data pool that carries the build) is only meant to exist for
+# the duration of this build. Without this trap it accumulates permanently (8G on
+# a 31.5G pool == pool fills to 100% after a few runs, as found on .189
+# 2026-08-08). Runs on ANY exit (success, error, Ctrl-C). Also removes a leftover
+# rpool/swap_build of an older run.
+DATA_ZPOOL=""      # set below when the build lives on a data pool
+cleanup_build_swap_zvol() {
+    local ds="$1"
+    if [ -n "$ds" ] && zfs list "$ds" >/dev/null 2>&1; then
+        echo "  -> Removing temporary build-swap ($ds)..."
+        swap -d "/dev/zvol/dsk/$ds" 2>/dev/null || true
+        zfs destroy "$ds" 2>/dev/null || true
     fi
+}
+cleanup_build_swap() {
+    cleanup_build_swap_zvol rpool/swap_build
+    if [ -n "$DATA_ZPOOL" ]; then cleanup_build_swap_zvol "$DATA_ZPOOL/swap_build"; fi
 }
 trap cleanup_build_swap EXIT
 
@@ -227,9 +235,82 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exit 1
 fi
 
-RUSTFS_DIR="/root/rustfs"
+# ---- build location: /root (rpool) when there is room, else the best data pool ----
+# Measured on .189 (2026-09-19, rustfs 1.0.0, 804 crates): build dir incl. target
+# 7.0G + cargo registry/git 3.8G + tmp ~1G = ~12G peak, plus a build-swap zvol of
+# up to 6G  ->  LOC_NEED_GB=22 (with margin).  Rule:
+#   1. rpool has >= LOC_NEED_GB free            -> classic /root/rustfs (+ /tmp)
+#   2. otherwise the non-root pool with the most free space (space of an old
+#      build dir on it counts, step 4 deletes it) if that is >= LOC_NEED_GB
+#      -> <pool>/rustfs_build, <pool>/cargo (CARGO_HOME), <pool>/tmp (TMPDIR)
+#   3. otherwise ABORT: building on a too-small rpool is what starved the box on
+#      .189 (watchdog "rpool avail < 600MB", sshd starved, ping 92ms).
+#      RUSTFS_FORCE_LOW_DISK=1 builds under /root anyway.
+# A data pool is only used if it is a real pool with a real mountpoint, so no
+# directory such as /tank is ever created on rpool by accident.
+LOC_NEED_GB=22
+RPOOL_FREE_GB=$(zfs list -H -o avail -p rpool 2>/dev/null | awk '{print int($1/1024/1024/1024)}')
+: "${RPOOL_FREE_GB:=0}"
+DATA_POOL=""       # mountpoint of the data pool ("" = build under /root)
+DATA_ZPOOL=""      # its zfs pool name
+if [ "$RPOOL_FREE_GB" -lt "$LOC_NEED_GB" ]; then
+    BEST_FREE_GB=0
+    for P in $(zpool list -H -o name 2>/dev/null); do
+        if [ "$P" = "rpool" ]; then continue; fi
+        MP=$(zfs get -H -o value mountpoint "$P" 2>/dev/null)
+        case "$MP" in /?*) ;; *) continue ;; esac
+        P_FREE_GB=$(zfs list -H -o avail -p "$P" 2>/dev/null | awk '{print int($1/1024/1024/1024)}')
+        : "${P_FREE_GB:=0}"
+        OLD_GB=0
+        if [ -d "$MP/rustfs_build" ]; then
+            OLD_GB=$(du -sk "$MP/rustfs_build" 2>/dev/null | awk '{print int($1/1024/1024)}')
+            : "${OLD_GB:=0}"
+        fi
+        P_FREE_GB=$((P_FREE_GB + OLD_GB))
+        if [ "$P_FREE_GB" -gt "$BEST_FREE_GB" ]; then
+            BEST_FREE_GB=$P_FREE_GB; DATA_ZPOOL="$P"; DATA_POOL="$MP"
+        fi
+    done
+    if [ "$BEST_FREE_GB" -lt "$LOC_NEED_GB" ]; then
+        DATA_POOL=""; DATA_ZPOOL=""
+        echo "  !! rpool has ${RPOOL_FREE_GB}G free and no data pool has ${LOC_NEED_GB}G (best: ${BEST_FREE_GB}G)."
+        echo "     The release build needs ~${LOC_NEED_GB}G (build ~12G + swap). Free space on rpool"
+        echo "     (old boot environments: beadm list / snapshots) or attach a data pool,"
+        echo "     or run with RUSTFS_FORCE_LOW_DISK=1 to try /root anyway."
+        if [ "${RUSTFS_FORCE_LOW_DISK:-0}" != "1" ]; then
+            exit 1
+        fi
+    fi
+fi
+if [ -n "$DATA_POOL" ]; then
+    RUSTFS_DIR="$DATA_POOL/rustfs_build"
+    LOGFILE="$DATA_POOL/rustfs-build.log"
+    export CARGO_HOME="$DATA_POOL/cargo"
+    export TMPDIR="$DATA_POOL/tmp"
+    mkdir -p "$CARGO_HOME" "$TMPDIR"
+    echo "  -> rpool has ${RPOOL_FREE_GB}G free: build dir, registry and tmp on $DATA_POOL ($DATA_ZPOOL)"
+else
+    RUSTFS_DIR="/root/rustfs"
+    LOGFILE="/tmp/rustfs-build.log"
+    echo "  -> rpool has ${RPOOL_FREE_GB}G free: classic build under /root (+/tmp)"
+fi
 RUSTFS_REPO="https://github.com/rustfs/rustfs"
-LOGFILE="/tmp/rustfs-build.log"
+# Optional: keep the cargo target dir OUTSIDE RUSTFS_DIR. Step 4 deletes and
+# re-clones RUSTFS_DIR on every run, so a failed/interrupted build otherwise
+# loses all compiled crates (2+ hours on a 4-vCPU box). With an external target
+# dir a re-run reuses them and only recompiles what actually changed.
+#   RUSTFS_TARGET_DIR="/tank/rustfs_target"     # opt-in, empty = in-tree target
+RUSTFS_TARGET_DIR=""
+if [ -n "$RUSTFS_TARGET_DIR" ]; then
+    export CARGO_TARGET_DIR="$RUSTFS_TARGET_DIR"
+    mkdir -p "$CARGO_TARGET_DIR"
+fi
+# Optional: pin a known-good upstream revision (empty = build current main, as
+# documented in readme.txt). Upstream adds/renames manifest fields from time to
+# time (e.g. the pyroscope workspace dependency that broke step 7 on
+# 2026-09-19); an empty pin always builds main. Example:
+#   RUSTFS_PIN="9a2d06b370b4665116a93976377d658de65f1459"
+RUSTFS_PIN=""
 START_TS="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
 # Add a "key = value" line under [patch.crates-io] in the given Cargo.toml,
@@ -346,32 +427,30 @@ SWAP_GB=$((SWAP_KB / 1024 / 1024))
 echo "  Current swap: ${SWAP_GB}GB"
 
 if [ "$SWAP_GB" -lt 6 ]; then
-    # Dynamic sizing (2026-08-09): the old fixed `-V 8g` failed outright
-    # ("out of space") once rpool's free space dropped below 8G -- this
-    # pool is only 31.5G total, and everyday usage (BEs, snapshots, the
-    # build's own target/ dir) eats into that fast. Now we only ask for
-    # just enough to clear the 6GB threshold, and check pool headroom
-    # first so a tight pool degrades to a clear warning instead of a
-    # hard `set -e` abort mid-script.
+    # Dynamic sizing (2026-08-09): only ask for what clears the 6GB threshold and
+    # check the headroom first, so a tight pool degrades to a clear warning
+    # instead of a hard `set -e` abort mid-script.
+    # 2026-09-20: the ephemeral zvol lives on the pool that carries the build
+    # (rpool for /root builds, the data pool otherwise) -- the final rustfs bin
+    # crate peaks at ~11G RSS on a 14G box, and rpool may be nearly full.
     NEED_GB=$((6 - SWAP_GB))
-    POOL_AVAIL_GB=$(zfs list -H -o avail -p rpool | awk '{print int($1/1024/1024/1024)}')
-    # Require the swap zvol PLUS a few GB headroom for the build itself
-    # (target/ dir, cargo registry growth) -- not just the swap alone.
+    SWAP_ZPOOL="${DATA_ZPOOL:-rpool}"
+    POOL_AVAIL_GB=$(zfs list -H -o avail -p "$SWAP_ZPOOL" | awk '{print int($1/1024/1024/1024)}')
     if [ "$POOL_AVAIL_GB" -lt "$((NEED_GB + 3))" ]; then
-        echo "  WARNING: only ${POOL_AVAIL_GB}GB free on rpool, need ~${NEED_GB}GB"
+        echo "  WARNING: only ${POOL_AVAIL_GB}GB free on $SWAP_ZPOOL, need ~${NEED_GB}GB"
         echo "           swap + 3GB build headroom -- skipping extra swap."
         echo "           Build may fail with OOM if it needs the memory."
     else
-        echo "  -> Adding ${NEED_GB}GB swap zvol (pool has ${POOL_AVAIL_GB}GB free)..."
-        if ! zfs list rpool/swap_build >/dev/null 2>&1; then
-            zfs create -V "${NEED_GB}g" rpool/swap_build
+        echo "  -> Adding ${NEED_GB}GB swap zvol on $SWAP_ZPOOL (pool has ${POOL_AVAIL_GB}GB free)..."
+        if ! zfs list "$SWAP_ZPOOL/swap_build" >/dev/null 2>&1; then
+            zfs create -V "${NEED_GB}g" "$SWAP_ZPOOL/swap_build"
             sleep 2
         fi
-        swap -a /dev/zvol/dsk/rpool/swap_build 2>/dev/null || true
-        SWAP_KB=$(swap -l 2>/dev/null | awk 'NR>1 {sum+=$4} END {print sum+0}')
-        SWAP_GB=$((SWAP_KB / 1024 / 1024))
-        echo "  Swap after: ${SWAP_GB}GB"
+        swap -a "/dev/zvol/dsk/$SWAP_ZPOOL/swap_build" 2>/dev/null || true
     fi
+    SWAP_KB=$(swap -l 2>/dev/null | awk 'NR>1 {sum+=$4} END {print sum+0}')
+    SWAP_GB=$((SWAP_KB / 1024 / 1024))
+    echo "  Swap after: ${SWAP_GB}GB"
 fi
 echo ""
 
@@ -393,6 +472,11 @@ fi
 
 echo "  -> Cloning $RUSTFS_REPO ..."
 git clone "$RUSTFS_REPO" "$RUSTFS_DIR"
+if [ -n "${RUSTFS_PIN:-}" ]; then
+    echo "  -> Pinning revision $RUSTFS_PIN"
+    ( cd "$RUSTFS_DIR" && git checkout -q "$RUSTFS_PIN" ) || {
+        echo "ERROR: cannot check out $RUSTFS_PIN"; exit 1; }
+fi
 cd "$RUSTFS_DIR"
 echo "  -> Commit: $(git log --oneline -1)"
 echo ""
@@ -469,6 +553,15 @@ echo ""
 echo "[7/13] Patching rustfs/Cargo.toml..."
 
 sed -i '/^pprof = { workspace = true/s/^/# /'          rustfs/Cargo.toml
+# pyroscope needs the same treatment: step 6 comments the WORKSPACE entry out,
+# so the member entry inheriting it must go too. Without this, cargo aborts the
+# manifest with
+#   "error inheriting `pyroscope` from workspace root manifest's
+#    workspace.dependencies.pyroscope -> dependency.pyroscope was not found
+#    in workspace.dependencies"
+# (the .189 failure on 2026-09-19; pprof/jemalloc_pprof/mimalloc were already
+#  handled, only pyroscope was missing)
+sed -i '/^pyroscope = { workspace = true/s/^/# /'     rustfs/Cargo.toml
 sed -i '/^jemalloc_pprof = { workspace = true/s/^/# /' rustfs/Cargo.toml
 # mimalloc crashes on Illumos (SIGSEGV in mi_page_map_set_range_prim)
 sed -i '/^mimalloc = { workspace = true/s/^/# /'       rustfs/Cargo.toml
@@ -523,6 +616,16 @@ echo ""
 # ---------------------------------------------------------------------------
 # 9. cargo fetch
 # ---------------------------------------------------------------------------
+echo "[9/13] Verifying the patched manifests..."
+if ! cargo metadata --no-deps --format-version 1 >/dev/null; then
+    echo "ERROR: the patched manifests are invalid (cargo error above)."
+    echo "       Most likely a workspace-INHERITED entry was left behind by"
+    echo "       steps 6-8 (pyroscope / pprof / jemalloc_pprof / mimalloc):"
+    echo "       add the missing sed line there instead of patching by hand."
+    exit 1
+fi
+echo "  -> manifests ok"
+
 echo "[9/13] Running cargo fetch..."
 rm -f Cargo.lock
 cargo fetch
@@ -762,7 +865,20 @@ echo "=== Build start: $(date) ===" > "$LOGFILE"
 
 cd "$RUSTFS_DIR/rustfs"
 
-export RUSTFLAGS="--cfg tokio_unstable -C link-arg=-lsocket -C link-arg=-lnsl"
+# Linker flags. illumos uses the Solaris ld (NOT GNU ld) -- there is no
+# --gc-sections, the equivalents are:
+#   -z ignore      drop unreferenced sections (this is what the 2026-08-09
+#                  builds used). Without it the Sep-2026 revision produced a
+#                  479M binary instead of ~250M: 164398 sections,
+#                  .note.GNU-stack 42.7M, .tm_clone_table 6.9M, plus all
+#                  dead code still in .text (measured on .189 2026-09-19).
+#   -z noldynsym   do not emit .SUNW_ldynsym: illumos ld records ALL local
+#                  symbols there; 520792 entries with full Rust-mangled names
+#                  cost 99M of .dynstr + 11.9M of .SUNW_ldynsym.
+#   -B eliminate   drop unqualified global symbols from the symbol table
+#                  (optional, shrinks .dynstr/.dynsym further; not enabled by
+#                  default because it also removes names useful for pstack/mdb)
+export RUSTFLAGS="--cfg tokio_unstable -C link-arg=-lsocket -C link-arg=-lnsl -C link-arg=-Wl,-z,ignore -C link-arg=-Wl,-z,noldynsym"
 
 # codegen-units override (2026-08-09): the workspace's [profile.release]
 # hardcodes codegen-units = 1 (whole-crate single codegen unit, for best

@@ -41,6 +41,34 @@ Purpose:
     - main.rs: mimalloc global_allocator removed, init_from_env() fix
     - profiling.rs: no stubs needed (unsupported_impl is already exported)
 
+  The patch steps are self-checking: after step 8 the script runs
+  `cargo metadata --no-deps` and aborts with a clear message if a
+  workspace-inherited dependency (pyroscope / pprof / jemalloc_pprof /
+  mimalloc) was left uncommented. That exact case broke the build on
+  2026-09-19: upstream had added `pyroscope = { workspace = true, ... }`
+  to rustfs/Cargo.toml while step 6 comments the workspace entry out, so
+  only the member entry was missing from the patch (now fixed in step 7).
+
+  Optional speed-up for repeat builds: `RUSTFS_TARGET_DIR` (empty by default)
+  keeps cargo's target/ directory outside RUSTFS_DIR, so a re-run after an
+  aborted build reuses the already compiled crates instead of rebuilding them
+  (step 4 deletes and re-clones RUSTFS_DIR on every run).
+  Example:  RUSTFS_TARGET_DIR="/tank/rustfs_target"
+
+  Binary size (measured on .189, 2026-09-19/20): the 1.0.0 binary was
+  502'299'584 bytes (479M) -- and 115M of that was pure symbol bookkeeping:
+  illumos' ld records every local symbol in .SUNW_ldynsym, and 520'792
+  Rust-mangled names cost 99M of .dynstr. Passing `-z noldynsym` (do not emit
+  .SUNW_ldynsym) cut .dynstr to 4.8M and the binary to 386'715'984 bytes
+  (-115.6M, -23%); it only affects pstack/mdb stack traces. `-z ignore` (the
+  Solaris equivalent of --gc-sections, present in the Aug-2026 build's link
+  line) is kept in the link but made NO measurable difference here: Solaris ld
+  does not remove unreferenced code sections, so .text (244.7M -- live code of
+  the 1.0.0 dependency stack), .note.GNU-stack (42.7M), .tm_clone_table (6.9M)
+  and the 164'395 per-function sections stay. A link with GNU ld (gld) plus
+  --gc-sections would be needed for those. `-B eliminate` would trim the
+  remaining 4.8M symbol table but also removes names useful for debugging.
+
   This is the canonical script (successor to the 2a5..2a12 line; the
   full change history is in the script's header).
 
@@ -48,11 +76,21 @@ Usage:
   bash ./rustfs_omnios_1a.sh
 
 Requirements:
-  - OmniOS, ideally with >= 16 GB RAM and at least ~40 GB free disk
-    space on the rpool. Less RAM/disk space is cushioned by the script
-    itself (see step 3 and step 13 below) -- no manual preparation is
-    needed, but a very tight pool (< ~9 GB free) only produces a
-    warning, not an abort, and the build can then fail with OOM.
+  - OmniOS, ideally with >= 16 GB RAM. Disk space: a release build needs ~22 GB
+    (build dir ~12 GB incl. target/, registry ~1.5 GB, tmp, plus the build-swap
+    zvol of NEED_GB+3). Location rule (checked before step 1):
+      * rpool has >= 22 GB free  -> classic layout under /root (+ /tmp).
+      * otherwise the non-rpool pool with the most free space (mountpoint
+        must be a path; an old <mountpoint>/rustfs_build counts as reclaimable)
+        takes build dir, CARGO_HOME, TMPDIR and the log, and the step-3 swap
+        zvol (<pool>/swap_build) goes there as well. Needs >= 22 GB.
+      * neither has 22 GB -> the script aborts with a hint (free old boot
+        environments / snapshots, attach a pool). RUSTFS_FORCE_LOW_DISK=1
+        forces the classic /root build anyway (may fail with ENOSPC/OOM).
+    The 14 GB / 4-vCPU .189 box (rpool ~3.7 GB free, /tank ~18 GB + the old
+    12 GB build) needs the data pool: the final rustfs bin crate peaks around
+    5.4 GB RSS, and without swap on the data pool the watchdog kills the build
+    once rpool drops below 600 MB free.
   - System Rust via pkg (OOCE developer/rust, >= 1.97). A stale rustup
     toolchain from an earlier build is removed automatically.
   - bash
@@ -219,6 +257,25 @@ Purpose:
 ==========================================================================
  Change history of this file
 ==========================================================================
+2026-09-20  rustfs_omnios_1a.sh: location rule corrected (review of the copy
+            /root/rustfs_omnios_1.0_release.sh on .189): the old check would
+            still have picked /root with only ~3.7 GB free on rpool. Now:
+            rpool >= 22 GB -> /root, else the best data pool >= 22 GB (an
+            old rustfs_build there counts as reclaimable), else abort
+            (RUSTFS_FORCE_LOW_DISK=1 overrides). The step-3 swap zvol follows
+            the chosen pool and the EXIT trap removes it from rpool and from
+            the data pool. Tested with a mocked zfs/zpool/du simulation
+            (scenarios A-H) on OmniOS.
+2026-09-19  rustfs_omnios_1a.sh: data-pool layout (build dir, CARGO_HOME,
+            TMPDIR and the log go to /tank when that pool exists; the step-3
+            build-swap zvol falls back to /tank when rpool is tight and is
+            removed again by the EXIT trap), optional RUSTFS_PIN and
+            RUSTFS_TARGET_DIR (both empty by default; the latter keeps the
+            target/ dir outside RUSTFS_DIR so a re-run does not rebuild
+            everything), the missing pyroscope workspace-entry sed
+            in step 7 and a `cargo metadata` gate after step 8. Reason: the
+            .189 build died on the pyroscope manifest error, and a nearly
+            full rpool killed/thrashed the build twice (2026-09-19).
 2026-09-01  Translated German -> English (Gea: "alle docs und readme in
             en").
 2026-09-01  Renamed from _readme.txt to readme.txt. Content fix: the
