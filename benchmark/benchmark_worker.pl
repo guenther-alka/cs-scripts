@@ -10,13 +10,21 @@
 # USAGE
 #   perl benchmark_worker.pl <runid> [key=value ...]
 #   keys (argv overrides the parameter file):
-#     profile=quick|basic|database|fileserver|mediaserver|mailserver|individual
+#     profile=quick|basic|database|fileserver|mediaserver|mailserver|steadywrite|individual
 #     pool=<zpool name>                (default: first pool from zpool list)
 #     streams=1|5|auto                 (default: auto, capped by vCPU count)
 #     load=readheavy|writeheavy|balanced
 #     filesize_ram=<percent>           (only honoured for profile=individual)
 #     four_k=yes|no   syncwrite=yes|no   mixed=yes|no   steady=yes|no
-#     steady_min=<minutes>             (default 30)
+#     conc1=yes|no                     concurrent 1 reader + 1 writer (default: only database,
+#                                      fileserver, individual; the N+N variant always runs)
+#     steady_min=<minutes>             (default 30 = TOTAL minutes of the steady run)
+#     steady_interval=<seconds>        (default 30 = sample window)
+#   profile=steadywrite = ONLY the steady write test (cs_26.09.19.9, Gea): three variants
+#     one after the other -- singlestream write | N streams write | concurrent read+write
+#     single stream (1 reader + 1 writer) -- steady_min/3 minutes each (30 -> 10 min each),
+#     one "steady_sample:" log line per window = the write performance HISTORY that the
+#     napp-it frontend draws as text bars (and stores per run).
 #     rundir=<dir>                     (default: directory of this script)
 #     check=yes                        resolve env + test medium and exit (no I/O)
 #
@@ -72,6 +80,13 @@
 #   * concurrency uses threads (the project loads 'threads' on every platform)
 #   * a mirror already splits a single stream over both disks -> the 1-vs-N
 #     stream ratio is NOT expected to be N; it is reported, not promised.
+#   * VERDICT (cs_26.09.19.11): the run ends with RESULT verdict (storage-bound | partial |
+#     cache | tool-limited | indicative), verdict_text (sync write, 4k read, seq read with
+#     their classes) and verdict_note (why: Windows page cache, tool ceiling, CPU-limited
+#     streams).  The async write is a cache indicator and is not rated.
+#   * fast profiles (quick/basic): test file capped at 2 GB, concurrent 1+1 only in
+#     database/fileserver/individual, multiuser 1-stream value = the 4k single-stream read
+#     (same file/blocksize), zfs set sync only when the mode changes.
 # =============================================================================
 
 use strict;
@@ -134,13 +149,15 @@ if (($P{help} // '') =~ /^y/i) {
     print <<"USAGE";
 $ME -- ZFS pool benchmark, runs ON the machine under test.
   usage:  perl $ME [runid] [key=value ...]
-  keys:   profile=quick|basic|database|fileserver|mediaserver|mailserver|individual
+  keys:   profile=quick|basic|database|fileserver|mediaserver|mailserver|steadywrite|individual
           pool=<zpool>        (default: first pool of 'zpool list')
           streams=1|5|auto    (default auto, capped by the vCPU count)
           load=readheavy|writeheavy|balanced
           four_k=yes|no   write=yes|no   syncwrite=yes|no
           mixed=yes|no    multiuser=yes|no
-          steady=yes|no   steady_min=30  steady_interval=30
+          conc1=yes|no        (concurrent 1+1; default only database/fileserver/individual)
+          steady=yes|no   steady_min=30 (TOTAL minutes)  steady_interval=30
+          profile=steadywrite: only the steady write test (single | N streams | concurrent r+w)
           filesize_ram=<percent of RAM>   (honoured for profile=individual only)
           rundir=<dir>        (default: the directory this script lives in)
 check=yes           resolve environment + test medium and exit (NO I/O, no dataset)
@@ -263,6 +280,8 @@ my %PROFILE = (
     fileserver  => { p4k => 30, sr => 30, sw => 20, aw => 15, mx => 30, mu => 20, four_k => 1 },
     mediaserver => { p4k => 10, sr => 45, sw => 20, aw => 20, mx => 20, mu => 15, four_k => 0 },
     mailserver  => { p4k => 15, sr => 15, sw => 45, aw => 10, mx => 25, mu => 20, four_k => 1 },
+    # steadywrite: ONLY the steady write test (no other phase) -- see the STEADY section below
+    steadywrite => { p4k => 0,  sr => 0,  sw => 0,  aw => 0,  mx => 0,  mu => 0,  four_k => 0, steadyonly => 1 },
 );
 my %PROF_FALLBACK = %{ $PROFILE{basic} };   # 'individual' without explicit keys
 
@@ -284,9 +303,19 @@ my $T_SYNC    = (($P{syncwrite}  // 'yes') =~ /^y/i) ? 1 : 0;
 my $T_ASYNC   = (($P{write}      // 'yes') =~ /^y/i) ? 1 : 0;
 my $T_MIXED   = (($P{mixed}      // 'yes') =~ /^y/i) ? 1 : 0;
 my $T_MULTI   = (($P{multiuser}  // 'yes') =~ /^y/i) ? 1 : 0;
+# concurrent 1 reader + 1 writer (RESULT conc_*): cs_26.09.19.11 -- only in the profiles that
+# care (database, fileserver, individual); the N+N variant (conc5_*) always runs and says the
+# same in less time.  conc1=yes|no overrides; with streams=1 there is no N+N -> 1+1 runs.
+my $T_CONC1   = defined($P{conc1}) ? (($P{conc1} =~ /^y/i) ? 1 : 0)
+                                   : (($PROFILE =~ /^(?:database|fileserver|individual)$/) ? 1 : 0);
+$T_CONC1 = 1 if $STREAMS < 2;
 my $T_STEADY  = (($P{steady}     // 'no')  =~ /^y/i) ? 1 : 0;
-my $STEADY_MIN = $P{steady_min} // 30;
+my $STEADYONLY = $C{steadyonly} ? 1 : 0;       # profile steadywrite: the steady test and NOTHING else
+if ($STEADYONLY) { $T_STEADY = 1; $T_FOUR_K = $T_SYNC = $T_ASYNC = $T_MIXED = $T_MULTI = 0; }
+my $STEADY_MIN = $P{steady_min} // 30;         # TOTAL minutes (steadywrite: split over its 3 variants)
+$STEADY_MIN = 30 unless $STEADY_MIN =~ /^\d+(?:\.\d+)?$/ && $STEADY_MIN > 0;
 my $STEADY_IV  = $P{steady_interval} // 30;    # 30 s aggregation window (user spec)
+$STEADY_IV = 30 unless $STEADY_IV =~ /^\d+$/ && $STEADY_IV >= 1;
 my $CHECK      = (($P{check}       // 'no')  =~ /^y/i) ? 1 : 0;   # dry run, no I/O
 
 my $POOL = $P{pool} // '';
@@ -359,6 +388,7 @@ my $MEDIA_KIND = 'folder';
 my $HAVE_SYNC_PROP = 0;
 my $HAVE_CACHE_PROP = 0;
 my $CACHE_MODE = 'metadata';
+my $CUR_SYNC = '';               # sync mode the scratch dataset currently has (see set_sync)
 
 # recordsize matters: with the default 128K a 4k random read pulls a whole
 # 128K record (32x amplification) -> the 4k test gets its OWN file written at
@@ -510,6 +540,7 @@ sub mk_media {
     }
     # on Windows the mountpoint property is unusable (see _win_ds_path)
     $DS_CREATED = 1;
+    $CUR_SYNC = $sync_mode if $HAVE_SYNC_PROP;      # the dataset was created with sync=$sync_mode
     $TESTDIR = $OSISWIN ? _win_ds_path($DS)
                         : _norm_mnt(_sys("zfs get -H -o value mountpoint \"$DS\""));
     # SAFETY NET: an empty/useless medium path must never become a RELATIVE path
@@ -535,11 +566,16 @@ sub mk_media {
     return 1;
 }
 
+# cs_26.09.19.11: a zfs set costs a process start (on Windows cmd /c + temp file) -> skipped
+# when the dataset already has that mode.  $CUR_SYNC is set by mk_media (created with
+# sync=standard) and only updated when zfs set really worked, so a failure is retried.
 sub set_sync {
     my ($mode) = @_;
     return unless $MEDIA_KIND eq 'dataset' && $HAVE_SYNC_PROP;
+    return if $CUR_SYNC eq $mode;
     my $o = _sys("zfs set sync=$mode \"$DS\"", 1);
     blog("bench_note: zfs set sync=$mode -> " . ($o =~ /\S/ ? $o : 'ok'));
+    $CUR_SYNC = $mode unless $o =~ /cannot|denied|error|invalid/i;
 }
 
 sub rm_media {
@@ -628,9 +664,14 @@ sub cancel_requested { return (-f $CANCEL) ? 1 : 0; }
 # platform, incl. Windows); if unavailable we fall back to serial with a note.
 my $HAVE_THREADS = 0;
 eval { require threads; threads->import(); $HAVE_THREADS = 1; };
+# steady write samples its stream threads through a shared counter array (live window lines)
+my $HAVE_SHARED = 0;
+if ($HAVE_THREADS) { eval { require threads::shared; threads::shared->import(); $HAVE_SHARED = 1; }; }
 
 # ---- coarse, mergeable latency histogram (microseconds) ---------------------
-my @HB = (250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000);
+# 12 buckets (cs_26.09.19.11: 50 and 100 us added so NVMe/SSD latencies are told apart
+# from HDD; p50/p99 are reported as the UPPER bound of the bucket, "100" = <= 100 us)
+my @HB = (50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000);
 sub new_hist { return [ (0) x (scalar(@HB) + 1) ]; }
 sub hist_add { my ($h, $us) = @_; my $i = 0; $i++ while $i < @HB && $us > $HB[$i]; $h->[$i]++; }
 sub hist_merge { my ($a, $b) = @_; $a->[$_] += $b->[$_] for 0 .. $#HB; }
@@ -656,6 +697,7 @@ sub _worker_read {
     my ($n, $bytes, $max) = (0, 0, 0);
     my $buf = '';
     my $lin = 0;                     # linear sweep position (sequential mode)
+    my $rmask = ($bs >= 262144) ? 0 : 0xFF;    # how often the phase clock is checked (see below)
     my $t0 = time();
     while (1) {
         # $seq: walk the file from 0 upwards (a REAL sequential read, so ZFS can
@@ -671,7 +713,10 @@ sub _worker_read {
         $n++;
         $bytes += $r if defined $r;
         if ($seq) { $lin += $bs; $lin = 0 if $lin >= $size; }
-        if (($n & 0xFF) == 0) { last if time() - $t0 >= $dur; }
+        # cs_26.09.19.11: check after EVERY large read.  The 256-iteration mask let a 1 MB seq read
+        # overrun its 10 s phase by ~46 s on a slow pool (measured on .50: 5.5 MB/s -> 256 reads = 46 s,
+        # the quick run took 135 s instead of ~85 s).  Small blocks keep the cheap mask.
+        if (($n & $rmask) == 0) { last if time() - $t0 >= $dur; }
     }
     close $fh;
     return ($n, $bytes, time() - $t0, $max, $h);
@@ -778,12 +823,17 @@ sub _zpool_bw_mbs {
 }
 
 # storage-bound | cache | tool-limited(CPU) -- the honest label per measurement
+# cs_26.09.19.11: the Perl reader tops out at ~95-168k 4k IOPS (measured 2026.09.18/19,
+# 1 vCPU .. .50).  A read that is NOT a cache hit but reaches this range measured the TOOL:
+# the storage may be faster, so it is labelled tool-limited (= "at least this fast").
+my $TOOL_IOPS = 80000;
 sub classify {
     my ($res, $sample) = @_;
     return 'n/a' if $MEDIA_KIND ne 'dataset' || !$HAVE_CACHE_PROP;
     my $bw = _zpool_bw_mbs($sample);
     return 'n/a (no vdev data)' if $bw < 0;
     return 'cache' if $bw < $res->{mbs} * 0.10;
+    return 'tool-limited' if ($res->{iops} // 0) >= $TOOL_IOPS;
     return 'storage-bound' if $bw >= $res->{mbs} * 0.50;
     return 'partial';
 }
@@ -850,6 +900,134 @@ sub steady_write {
     return ($med, scalar(@win), ($bytes / 1048576) / (time() - $t0));
 }
 
+# ---- steady write, multi-stream (cs_26.09.19.9, Gea: profile steadywrite) -----------
+# One thread = one stream (writer or reader).  Every thread publishes CUMULATIVE
+# counters into the shared array $sh at [$slot..$slot+2] = (bytes, ops, latency sum in
+# us); each slot has exactly ONE writer, so no lock/reset protocol is needed.  The main
+# thread (steady_run) only DIFFS the counters per window -> MB/s history ("Verlauf").
+sub _steady_thread {
+    my ($mode, $file, $cap, $bs, $dur, $sh, $slot, $off0, $t0) = @_;
+    open(my $fh, ($mode eq 'w' ? '+<' : '<'), $file) or return 0;
+    binmode $fh;
+    srand((int(time() * 1000) + $slot * 7919) % 2147483647);     # threads clone the PRNG state
+    my $blk = 'S' x $bs;
+    my $blocks = int($cap / $bs); $blocks = 1 if $blocks < 1;
+    my ($off, $bytes, $n, $us_sum, $buf) = ($off0, 0, 0, 0, '');
+    while (1) {
+        my $s = time();
+        if ($mode eq 'w') {
+            sysseek($fh, $off, 0);
+            my $w = syswrite($fh, $blk);
+            $bytes += $w if defined $w;
+            $off += $bs; $off = 0 if $off + $bs > $cap;      # wrap -> in-place overwrite, no growth
+        } else {
+            sysseek($fh, int(rand($blocks)) * $bs, 0);
+            my $r = sysread($fh, $buf, $bs);
+            $bytes += $r if defined $r;
+        }
+        my $now = time();
+        $us_sum += ($now - $s) * 1e6;
+        $n++;
+        $sh->[$slot] = $bytes; $sh->[$slot + 1] = $n; $sh->[$slot + 2] = $us_sum;
+        last if $now - $t0 >= $dur;
+        last if ($n & 0x0F) == 0 && cancel_requested();
+    }
+    close $fh;
+    return $bytes;
+}
+
+# (median of the LAST QUARTER = steady state, avg, min, max) of a MB/s window list
+sub _steady_stats {
+    my ($w) = @_;
+    return (0, 0, 0, 0) unless $w && @$w;
+    my $q = int(@$w / 4);
+    my @tail = sort { $a <=> $b } ($q > 0 ? @{$w}[$q .. $#$w] : @$w);
+    my $med = $tail[int(@tail / 2)];
+    my ($sum, $min, $max) = (0, $w->[0], $w->[0]);
+    for (@$w) { $sum += $_; $min = $_ if $_ < $min; $max = $_ if $_ > $max; }
+    return ($med, $sum / @$w, $min, $max);
+}
+
+# ONE variant: $nw writer streams + $nr reader streams for $dur_s seconds, one
+# "steady_sample:" log line per $iv seconds (live -- the frontend can draw it while
+# the run is still going).  -> hashref or undef (skipped)
+sub steady_run {
+    my ($label, $file, $cap, $dur_s, $iv, $nw, $nr) = @_;
+    my $bs = 1048576;
+    my $nwin = int($dur_s / $iv); $nwin = 1 if $nwin < 1;
+    if (!$HAVE_THREADS || !$HAVE_SHARED) {
+        if ($label eq 'single' && $nr == 0) {        # serial fallback: the old inline loop, no live lines
+            my ($med, $wins, $avg) = steady_write($file, $cap, $dur_s, $iv, $bs);
+            return { w => [], r => [], med => ($med // 0), avg => ($avg // 0), min => 0, max => 0,
+                     windows => ($wins // 0), rmed => 0, nw => 1, nr => 0 };
+        }
+        blog("bench_note: steady $label skipped -- needs threads + threads::shared");
+        return undef;
+    }
+    my $sh = threads::shared::shared_clone([ (0) x (3 * ($nw + $nr)) ]);
+    my $t0 = time();
+    my (@th, $slot);
+    $slot = 0;
+    my $per = int(($cap / $bs) / ($nw || 1)); $per = 1 if $per < 1;
+    for my $i (0 .. $nw - 1) {                       # writers start at different offsets of the file
+        my ($sl, $off) = ($slot, $i * $per * $bs);
+        push @th, threads->create(sub { _steady_thread('w', $file, $cap, $bs, $dur_s, $sh, $sl, $off, $t0) });
+        $slot += 3;
+    }
+    my $rslot = $slot;
+    for my $i (0 .. $nr - 1) {
+        my $sl = $slot;
+        push @th, threads->create(sub { _steady_thread('r', $file, $cap, $bs, $dur_s, $sh, $sl, 0, $t0) });
+        $slot += 3;
+    }
+    my (@w, @r);
+    my ($pw, $pwn, $pwu, $pr, $prn, $pru) = (0, 0, 0, 0, 0, 0);
+    my $pt = $t0;
+    my $k = 0;
+    while ($k < $nwin && !cancel_requested()) {
+        my $due  = $t0 + ($k + 1) * $iv;
+        my $wait = $due - time();
+        select(undef, undef, undef, ($wait > 0.5 ? 0.5 : ($wait > 0 ? $wait : 0.01)));
+        my $now = time();
+        next if $now < $due;
+        my ($wb, $wn, $wu, $rb, $rn, $ru) = (0, 0, 0, 0, 0, 0);
+        for my $j (0 .. $nw - 1) { my $s = 3 * $j;          $wb += $sh->[$s]; $wn += $sh->[$s + 1]; $wu += $sh->[$s + 2]; }
+        for my $j (0 .. $nr - 1) { my $s = $rslot + 3 * $j; $rb += $sh->[$s]; $rn += $sh->[$s + 1]; $ru += $sh->[$s + 2]; }
+        my $dt = $now - $pt; $dt = $iv if $dt <= 0;
+        my $wm  = (($wb - $pw) / 1048576) / $dt;
+        my $rm  = (($rb - $pr) / 1048576) / $dt;
+        my $dn  = ($wn - $pwn) + ($rn - $prn);
+        my $lat = $dn > 0 ? ((($wu - $pwu) + ($ru - $pru)) / $dn) / 1000 : 0;
+        push @w, $wm; push @r, $rm;
+        $k++;
+        blog(sprintf("steady_sample: %s t=%d write=%.1f read=%.1f iops=%.0f lat_avg=%.2f",
+                     $label, $now - $t0, $wm, $rm, $dn / $dt, $lat));
+        ($pw, $pwn, $pwu, $pr, $prn, $pru, $pt) = ($wb, $wn, $wu, $rb, $rn, $ru, $now);
+        # every 4th window: pool + SMART view (a 1 s zpool sample; smartctl is slow)
+        if ($k % 4 == 0 && $k < $nwin) {
+            blog(zpool_sample(1));
+            blog(smart_snapshot(sprintf("%s t=%ds", $label, $now - $t0)));
+        }
+    }
+    $_->join() for @th;
+    my ($med, $avg, $min, $max) = _steady_stats(\@w);
+    my ($rmed) = _steady_stats(\@r);
+    return { w => \@w, r => \@r, med => $med, avg => $avg, min => $min, max => $max,
+             windows => scalar(@w), rmed => $rmed, nw => $nw, nr => $nr };
+}
+
+sub steady_report {
+    my ($label, $res, $iv) = @_;
+    return unless $res;
+    bres("steady_${label}_mbs",     sprintf('%.1f', $res->{med}), 'MB/s write (median of the last quarter)');
+    bres("steady_${label}_avg_mbs", sprintf('%.1f', $res->{avg}), 'MB/s write (whole run incl. warm-up)');
+    bres("steady_${label}_min_mbs", sprintf('%.1f', $res->{min}), 'MB/s');
+    bres("steady_${label}_max_mbs", sprintf('%.1f', $res->{max}), 'MB/s');
+    bres("steady_${label}_windows", $res->{windows}, "x ${iv}s");
+    bres("steady_${label}_read_mbs", sprintf('%.1f', $res->{rmed}), 'MB/s read (median of the last quarter)')
+        if ($res->{nr} // 0) > 0;
+}
+
 # =============================================================================
 # GUARD: only ONE benchmark per member (parallel runs would skew the numbers)
 # =============================================================================
@@ -894,12 +1072,16 @@ bhdr('smartctl',  $SMARTCTL =~ /\S/ ? $SMARTCTL : 'n/a');
 bhdr('pools',     join(',', @POOLS) || 'n/a');
 bhdr('phases',    join(',', grep { /\S/ } (
                     $T_FOUR_K ? "4k:$C{p4k}s" : '',
-                    "seqread:$C{sr}s",
+                    ($C{sr} > 0 ? "seqread:$C{sr}s" : ''),
                     $T_SYNC  ? "syncwrite:$C{sw}s" : '',
                     $T_ASYNC ? "asyncwrite:$C{aw}s" : '',
-                    $T_MIXED ? "mixed:$C{mx}s" : '',
+                    $T_MIXED ? ("mixed(" . ($T_CONC1 ? "1+1," : '') . (($STREAMS >= 2) ? "${STREAMS}+${STREAMS}" : '')
+                                . "):$C{mx}s each") : '',
                     $T_MULTI ? "multiuser:$C{mu}s x$STREAMS" : '',
-                    $T_STEADY ? "steady:${STEADY_MIN}min/${STEADY_IV}s" : '')));
+                    $T_STEADY ? ($STEADYONLY ? "steadywrite:single+${STREAMS}streams+conc,${STEADY_MIN}min total/${STEADY_IV}s"
+                                             : "steady:${STEADY_MIN}min/${STEADY_IV}s") : '')));
+bhdr('steady_min',      $STEADY_MIN) if $T_STEADY;
+bhdr('steady_interval', $STEADY_IV)  if $T_STEADY;
 
 # =============================================================================
 # DRY CHECK (check=yes) -- resolve environment and test medium, create NOTHING
@@ -945,13 +1127,22 @@ if ($FREE_MB > 0) {
     if ($want_mb > $max) { $want_mb = $max; blog("bench_note: size clamped to free space ($FREE_MB MB free)"); }
 }
 $want_mb = 128 if $want_mb < 128;
+# cs_26.09.19.11: quick/basic are the "fast statement" profiles -- creating a 10%-of-RAM file
+# (6+ GB on a 64 GB host) was the longest single step.  primarycache=metadata keeps the data
+# out of the ARC, so a 2 GB file measures the same as a RAM-sized one.  Other profiles and
+# profile individual (filesize_ram) keep the RAM-derived size.
+my $SIZE_CAPPED = 0;
+if ($PROFILE =~ /^(?:quick|basic)$/ && $want_mb > 2048) {
+    $want_mb = 2048; $SIZE_CAPPED = 1;
+    blog("bench_note: test file capped at 2048 MB (profile $PROFILE; the RAM-derived size is not needed with primarycache=$CACHE_MODE)");
+}
 my $cap = $want_mb * 1048576;
 
 bhdr('media',     $MEDIA_KIND . ($DS =~ /\S/ ? " ($DS)" : " ($TESTDIR)"));
 bhdr('props',     ($HAVE_CACHE_PROP ? "primarycache=$CACHE_MODE secondarycache=none " : 'no cache props ')
                   . ($HAVE_SYNC_PROP ? 'sync=per-phase ' : 'no sync prop ')
                   . 'recordsize=4K(4k-test)/128K(main)');
-bhdr('filesize',  "${want_mb} MB (" . $SIZE_PCT . "% RAM, free=${FREE_MB}MB)");
+bhdr('filesize',  "${want_mb} MB (" . ($SIZE_CAPPED ? "capped, $PROFILE" : $SIZE_PCT . "% RAM") . ", free=${FREE_MB}MB)");
 bhdr('cpu_load',  cpu_load());
 blog(smart_snapshot('start'));
 blog(zpool_sample(1));
@@ -1001,6 +1192,8 @@ sub mixed_phase {
 # PHASES
 # =============================================================================
 my %CLASS = ();
+my %M     = ();        # the headline measurements of this run (hash refs of _meas) -> verdict()
+my $R4K;               # 4k random read, 1 stream (also serves as the multiuser 1-stream value)
 
 # --- 4k phases use their OWN file, written at recordsize=4K (see set_recordsize)
 my $file4k = File::Spec->catfile($TESTDIR, 'bench_4k.dat');
@@ -1023,6 +1216,7 @@ if ($T_FOUR_K && !cancel_requested()) {
     bres('4k_read_lat_p99_us', sprintf('%.0f', $r->{p99}),  'us');
     $CLASS{'4k_read'} = classify($r, $zs);
     bres('4k_read_class', $CLASS{'4k_read'}, '');
+    $M{r4k} = $R4K = $r;
     blog($zs);
     set_recordsize('128K');
 }
@@ -1032,6 +1226,7 @@ if (!cancel_requested()) {
     my $mk = make_testfile($file, $want_mb);
     bres('file_create_singleuser', sprintf('%.1f', $mk), 'MB/s');
 
+    if ($C{sr} > 0) {                # steadywrite has no read phase
     vlog('phase: sequential read (1MB, single stream, linear sweep)');
     my ($r, $zs) = phase(kind => 'read', file => $file, dur => $C{sr}, bs => 1048576,
                          streams => 1, seq => 1);
@@ -1039,7 +1234,9 @@ if (!cancel_requested()) {
     bres('seq_read_lat_p99_us', sprintf('%.0f', $r->{p99}), 'us');
     $CLASS{seq_read} = classify($r, $zs);
     bres('seq_read_class', $CLASS{seq_read}, '');
+    $M{seq} = $r;
     blog($zs);
+    }
 }
 
 if ($T_SYNC && !cancel_requested()) {
@@ -1052,6 +1249,7 @@ if ($T_SYNC && !cancel_requested()) {
     bres('sync_write_lat_p99_ms', sprintf('%.1f', $r->{p99} / 1000), 'ms');
     $CLASS{sync_write} = classify($r, $zs);
     bres('sync_write_class', $CLASS{sync_write}, '');
+    $M{sync} = $r;
     blog($zs);
 }
 
@@ -1070,27 +1268,51 @@ if ($T_ASYNC && !cancel_requested()) {
     blog($zs);
 }
 
-if ($T_MIXED && !cancel_requested()) {
-    vlog('phase: concurrent read+write (2 readers + 2 writers)');
-    set_sync('standard');
-    my $th = ($HAVE_THREADS && $HAVE_ZPOOL) ? threads->create(sub { zpool_sample($C{mx}) }) : undef;
-    my ($R, $W) = mixed_phase(file => ($file_small =~ /\S/ ? $file_small : $file),
-                              dur => $C{mx}, bs => 4096, cap => $cap,
-                              nread => 2, nwrite => 2);
-    my $zs = $th ? (($th->join())[0] // '') : zpool_sample(1);
-    bres('conc_read_mbs',         sprintf('%.1f', $R->{mbs}),  'MB/s (2 streams)');
-    bres('conc_write_mbs',        sprintf('%.1f', $W->{mbs}),  'MB/s (2 streams)');
-    bres('conc_read_lat_p99_us',  sprintf('%.0f', $R->{p99}),  'us');
-    bres('conc_write_lat_p99_ms', sprintf('%.1f', $W->{p99} / 1000), 'ms');
-    $CLASS{conc} = classify({ mbs => $R->{mbs} + $W->{mbs} }, $zs);
-    bres('conc_class', $CLASS{conc}, '');
-    blog($zs);
+# concurrent read+write, run TWICE (cs_26.09.19.9, Gea): 1 reader + 1 writer ("concurrent1stream", RESULT
+# conc_*) and N readers + N writers ("concurrent5streams", N = streams, RESULT conc5_*).  Runs made before
+# cs_26.09.19.9 measured 2 readers + 2 writers for the first variant -- their conc_* values are not comparable.
+if ($T_MIXED) {
+    # cs_26.09.19.11: the 1+1 variant only when $T_CONC1 (database/fileserver/individual, conc1=yes)
+    my @cfgs = ();
+    push @cfgs, ['conc', 1]         if $T_CONC1;
+    push @cfgs, ['conc5', $STREAMS] if $STREAMS >= 2;
+    blog("bench_note: concurrent 1+1 not run in profile $PROFILE (conc1=yes adds it); the ${STREAMS}+${STREAMS} phase runs")
+        if !$T_CONC1 && @cfgs;
+    for my $cfg (@cfgs) {
+        my ($pfx, $n) = @$cfg;
+        last if cancel_requested();
+        vlog("phase: concurrent read+write ($n readers + $n writers)");
+        set_sync('standard');
+        my $th = ($HAVE_THREADS && $HAVE_ZPOOL) ? threads->create(sub { zpool_sample($C{mx}) }) : undef;
+        my ($R, $W) = mixed_phase(file => ($file_small =~ /\S/ ? $file_small : $file),
+                                  dur => $C{mx}, bs => 4096, cap => $cap,
+                                  nread => $n, nwrite => $n);
+        my $zs = $th ? (($th->join())[0] // '') : zpool_sample(1);
+        my ($rn, $wn) = ($pfx eq 'conc') ? ('conc_read_lat_p99_us', 'conc_write_lat_p99_ms')
+                                         : ('conc5_read_p99_us',    'conc5_write_p99_ms');
+        bres("${pfx}_read_mbs",  sprintf('%.1f', $R->{mbs}), "MB/s ($n streams)");
+        bres("${pfx}_write_mbs", sprintf('%.1f', $W->{mbs}), "MB/s ($n streams)");
+        bres($rn, sprintf('%.0f', $R->{p99}), 'us');
+        bres($wn, sprintf('%.1f', $W->{p99} / 1000), 'ms');
+        $CLASS{$pfx} = classify({ mbs => $R->{mbs} + $W->{mbs} }, $zs);
+        bres("${pfx}_class", $CLASS{$pfx}, '');
+        blog($zs);
+    }
 }
 
 if ($T_MULTI && !cancel_requested()) {
     vlog("phase: multiuser read (4k, 1 vs $STREAMS streams)");
-    my ($r1) = phase(kind => 'read', file => ($file_small =~ /\S/ ? $file_small : $file),
-                     dur => $C{mu}, bs => 4096, streams => 1);
+    # cs_26.09.19.11: the 1-stream value IS the 4k single-stream read (same file, same 4k blocks,
+    # random) -> reused when that phase ran; otherwise measured here WITHOUT a zpool sampler
+    # (its output was never used for this value).
+    my $r1;
+    if ($R4K && $file_small =~ /\S/) {
+        $r1 = $R4K;
+        blog('bench_note: multiuser 1-stream value = the 4k single-stream read (same file and block size, not measured twice)');
+    } else {
+        $r1 = _meas(kind => 'read', file => ($file_small =~ /\S/ ? $file_small : $file),
+                    dur => $C{mu}, bs => 4096, streams => 1);
+    }
     bres('multiuser_read_1_mbs', sprintf('%.1f', $r1->{mbs}), 'MB/s');
     my ($rn, $zs) = phase(kind => 'read', file => ($file_small =~ /\S/ ? $file_small : $file),
                           dur => $C{mu}, bs => 4096, streams => $STREAMS);
@@ -1105,14 +1327,82 @@ if ($T_MULTI && !cancel_requested()) {
 }
 
 if ($T_STEADY && !cancel_requested()) {
-    vlog("phase: steady write ($STEADY_MIN min, sample every ${STEADY_IV}s)");
     set_sync('always');
-    my ($med, $wins, $avg) = steady_write($file, $cap, $STEADY_MIN * 60, $STEADY_IV, 1048576);
-    bres('steady_write_mbs',     sprintf('%.1f', $med), 'MB/s (median of the last quarter)');
-    bres('steady_write_avg_mbs', sprintf('%.1f', $avg), 'MB/s (whole run incl. warm-up)');
-    bres('steady_write_windows', $wins, "x ${STEADY_IV}s");
+    # profile steadywrite: 3 variants one after the other, steady_min is the TOTAL; steady=yes in any other
+    # profile (individual): the single-stream variant only, steady_min minutes
+    my @var = $STEADYONLY ? (['single', 1, 0], ['nstream', $STREAMS, 0], ['conc', 1, 1]) : (['single', 1, 0]);
+    my $per_s = int($STEADY_MIN * 60 / scalar(@var));
+    $per_s = $STEADY_IV if $per_s < $STEADY_IV;
+    for my $v (@var) {
+        last if cancel_requested();
+        my ($label, $nw, $nr) = @$v;
+        vlog("phase: steady write $label ($nw writers + $nr readers, ${per_s}s, sample every ${STEADY_IV}s)");
+        blog("steady_variant: $label writers=$nw readers=$nr seconds=$per_s window=${STEADY_IV}s");
+        my $res = steady_run($label, $file, $cap, $per_s, $STEADY_IV, $nw, $nr);
+        steady_report($label, $res, $STEADY_IV);
+        if ($label eq 'single' && $res) {            # legacy names (results.csv column steady_mbs)
+            bres('steady_write_mbs',     sprintf('%.1f', $res->{med}), 'MB/s (median of the last quarter)');
+            bres('steady_write_avg_mbs', sprintf('%.1f', $res->{avg}), 'MB/s (whole run incl. warm-up)');
+            bres('steady_write_windows', $res->{windows}, "x ${STEADY_IV}s");
+        }
+    }
     blog(zpool_sample(1));
     blog(smart_snapshot('end'));
+}
+
+# =============================================================================
+# VERDICT -- the concise statement about the storage (cs_26.09.19.11)
+# =============================================================================
+# ONE rating + ONE line + an optional note, derived only from what was measured and classified.
+# Rated values: sync write, 4k read, seq read.  The async write is a cache indicator and is NOT
+# rated.  Ratings (same words as the per-phase classes):
+#   storage-bound  every rated value came from the vdevs (tool-limited reads count as "at least")
+#   partial        part of the rated values did not come (fully) from the vdevs
+#   cache          no rated value came from the vdevs -- these are cache speeds
+#   tool-limited   no cache hit, but every rated value reached the tool's own ceiling
+#   indicative     no scratch dataset / cache control / vdev data -> the numbers include caches
+sub _lat_txt { my ($us) = @_; return ($us >= 1000) ? sprintf('%.1f ms', $us / 1000) : sprintf('%d us', $us); }
+
+sub verdict {                    # -> (rating, one line, note)   rating '' = nothing rated
+    my %def = (sync => ['sync_write', 'sync write'], r4k => ['4k_read', '4k read'], seq => ['seq_read', 'seq read']);
+    my ($nok, $npart, $ncache, $ntool, $nn) = (0, 0, 0, 0, 0);
+    my (@txt, @note);
+    for my $k (qw(sync r4k seq)) {
+        my $r = $M{$k} or next;
+        my ($ck, $name) = @{ $def{$k} };
+        my $c = $CLASS{$ck} // 'n/a';
+        my $v = ($k eq 'r4k')   ? sprintf('%.0f IOPS p99 %s', $r->{iops}, _lat_txt($r->{p99}))
+              : ($k eq 'sync')  ? sprintf('%.0f MB/s p99 %s', $r->{mbs}, _lat_txt($r->{p99}))
+              :                   sprintf('%.0f MB/s', $r->{mbs});
+        $v = "at least $v" if $c eq 'tool-limited';
+        push @txt, "$name $v" . (($c =~ m{^n/a}) ? '' : " ($c)");
+        $nn++;
+        if    ($c eq 'storage-bound') { $nok++; }
+        elsif ($c eq 'partial')       { $npart++; }
+        elsif ($c eq 'cache')         { $ncache++; }
+        elsif ($c eq 'tool-limited')  { $ntool++; }
+    }
+    return ('', '', '') unless $nn;
+    my $rated = $nok + $npart + $ncache + $ntool;
+    my $lvl;
+    if (!$rated) {
+        $lvl = 'indicative';
+        push @note, ($MEDIA_KIND ne 'dataset' || !$HAVE_CACHE_PROP)
+                  ? 'no scratch dataset / cache properties: the values include OS and ZFS caches'
+                  : 'no vdev data from zpool iostat: cache and storage cannot be told apart';
+    }
+    elsif ($ncache == 0 && $npart == 0) { $lvl = $nok ? 'storage-bound' : 'tool-limited'; }
+    elsif ($ncache == $rated)           { $lvl = 'cache'; }
+    else                                { $lvl = 'partial'; }
+    if ($ncache > 0) {
+        push @note, $OSISWIN
+            ? 'Windows: reads are served from the OS page cache - only the sync write rates the pool'
+            : 'cache values are cache speed, not a storage limit';
+    }
+    push @note, "a read reached the tool ceiling (~$TOOL_IOPS IOPS) - the storage may be faster" if $ntool > 0;
+    push @note, "more streams than vCPU ($VCPU): multi-stream values are CPU-limited" if $STREAMS_CLAMPED;
+    push @note, 'sync write is not a real sync test here (no sync=always)' if $T_SYNC && !($HAVE_SYNC_PROP && $MEDIA_KIND eq 'dataset');
+    return ($lvl, join(' | ', @txt), join('; ', @note));
 }
 
 # =============================================================================
@@ -1137,6 +1427,16 @@ if ($MEDIA_KIND ne 'dataset' || !$HAVE_SYNC_PROP) {
 }
 for my $k (sort keys %CLASS) {
     blog(sprintf("bench_class: %-12s = %s", $k, $CLASS{$k}));
+}
+unless ($STEADYONLY) {                       # steadywrite has its own tables/charts, no rating
+    my ($vl, $vt, $vn) = verdict();
+    if ($vl =~ /\S/) {
+        bres('verdict',      $vl, '');
+        bres('verdict_text', $vt, '');
+        bres('verdict_note', $vn, '') if $vn =~ /\S/;
+        vlog("VERDICT: $vl -- $vt");
+        vlog("         note: $vn") if $vn =~ /\S/;
+    }
 }
 $DONE = 1;
 bdone('ok', sprintf('%.0fs profile=%s pool=%s media=%s', $tot, $PROFILE, $POOL, $MEDIA_KIND));

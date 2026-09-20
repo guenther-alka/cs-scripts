@@ -14,6 +14,26 @@ Measured per run
   test with one sample line every 30 s.  Every number carries p50/p99 latency
   and an honest class: storage-bound | cache | cache-influenced | tool-limited.
 
+The concise statement (RESULT verdict, verdict_text, verdict_note)
+  Every finished run ends with ONE rating, ONE line and a note, so the answer to
+  "how fast is this storage?" does not need the 40 detail lines:
+    verdict       storage-bound | partial | cache | tool-limited | indicative
+    verdict_text  sync write MB/s + p99, 4k read IOPS + p99, seq read MB/s, each with its class
+    verdict_note  why the rating is what it is (Windows page cache, the tool ceiling of
+                  ~80000 4k IOPS, more streams than vCPUs, no scratch dataset / no sync=always)
+  Rated: sync write, 4k read, seq read.  The async write is a cache indicator and is not rated.
+  storage-bound = the vdevs delivered the numbers (a read at the tool ceiling counts as "at least");
+  partial = only part of it did; cache = the numbers are cache speed; tool-limited = every rated
+  value hit the tool's ceiling; indicative = no scratch dataset / vdev data, caches are included.
+  Standalone runs on a terminal print it as "VERDICT: ..." (or add verbose=yes).
+
+Fast profiles (quick, basic)
+  Test file capped at 2 GB (primarycache=metadata makes a RAM-sized file unnecessary),
+  concurrent 1+1 only in database/fileserver/individual (conc1=yes adds it elsewhere; the N+N
+  variant always runs), the multiuser 1-stream value is the 4k single-stream read (same file and
+  block size, measured once), and zfs set sync is only issued when the mode changes.
+  Measured: profile=quick 82 s on Solaris 11.4 (1 vCPU, VMDK pool; 93-163 s before).
+
 Why the numbers can be trusted (the cache trap)
   * Test medium = a SCRATCH DATASET on the pool under test, created at start
     and destroyed again at the end (also on error/cancel):
@@ -69,12 +89,17 @@ Windows (measured 2026.09.18, OpenZFS on Windows zfswin-2.4.1rc15)
 Usage
   perl benchmark_worker.pl profile=quick pool=tank
   perl benchmark_worker.pl profile=mailserver syncwrite=yes load=balanced
+  perl benchmark_worker.pl profile=quick pool=tank conc1=yes   # add the concurrent 1+1 phase
   perl benchmark_worker.pl name_of_run profile=basic steady=yes steady_min=30
+  perl benchmark_worker.pl profile=steadywrite pool=tank steady_min=30
+      (steadywrite = ONLY the steady write test, 3 variants one after the other: singlestream
+       write | N streams write | concurrent 1 reader + 1 writer, steady_min = TOTAL minutes;
+       one "steady_sample:" log line per window = the write performance history)
   perl benchmark_worker.pl check=yes pool=tank   # dry run: resolve env + medium,
                                                  # create nothing (frontend probe)
   perl benchmark_worker.pl help=yes
 
-  profile=quick ~1-2 min, the others 5-10 min.  Without a runid the id is
+  profile=quick ~1-1.5 min, the others 5-10 min.  Without a runid the id is
   generated as auto_YYYYMMDD_HHMMSS.  Result: last_benchmark.log next to the
   script (rundir=/path to change), containing
     bench_hdr: ...            all parameters/environment of the run
