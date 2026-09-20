@@ -11,8 +11,8 @@ Claude (Anthropic)
 
 ```
 illumos/
-  rustfs_omnios_1a.sh          # RustFS build on OmniOS/illumos (canonical;
-                               # history of the 2a5..2a12 line in its header)
+  rustfs_omnios_1.0_release.sh # RustFS build on OmniOS/illumos (canonical;
+                               # renamed from rustfs_omnios_1a.sh, 2026-09-20; history of the 2a5..2a12 line in its header)
   cs-imageindex_omnios_1a.sh   # cs-imageindex build on OmniOS/illumos
   build_llamacpp_omnios.sh     # llama.cpp llama-server on OmniOS -- OpenAI-
                                # compatible local LLM (10 illumos patches,

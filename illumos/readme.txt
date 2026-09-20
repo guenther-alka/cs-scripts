@@ -15,7 +15,7 @@ All scripts are written for BASH:  bash <script>.sh
 
 Contents at a glance:
 
-  rustfs_omnios_1a.sh                 Build the RustFS server (S3 daemon)
+  rustfs_omnios_1.0_release.sh         Build the RustFS server (S3 daemon)
   cs-imageindex_omnios_1a.sh          Build + package cs-imageindex (media indexer)
   build_llamacpp_omnios.sh            Build llama.cpp llama-server (local LLM inference)
   build.rc.sh                         Install/update the rustfs-cli
@@ -23,7 +23,7 @@ Contents at a glance:
   needed_ip_modification_for_rustfs.txt  Raise TCP/UDP buffer sizes for rustfs
 
 ==========================================================================
- rustfs_omnios_1a.sh
+ rustfs_omnios_1.0_release.sh
 ==========================================================================
 Purpose:
   Builds the RustFS server from the main branch on GitHub for
@@ -73,7 +73,7 @@ Purpose:
   full change history is in the script's header).
 
 Usage:
-  bash ./rustfs_omnios_1a.sh
+  bash ./rustfs_omnios_1.0_release.sh
 
 Requirements:
   - OmniOS, ideally with >= 16 GB RAM. Disk space: a release build needs ~22 GB
@@ -257,6 +257,11 @@ Purpose:
 ==========================================================================
  Change history of this file
 ==========================================================================
+2026-09-20  Renamed to rustfs_omnios_1.0_release.sh (Gea: "im upload name
+            rustfs_omnios_1.0_release.sh belassen (alte version war beta1)").
+            Content unchanged apart from the name: script header + usage line,
+            this readme, README.md and the cs-imageindex comment. The older
+            history entries below keep the old file name.
 2026-09-20  rustfs_omnios_1a.sh: location rule corrected (review of the copy
             /root/rustfs_omnios_1.0_release.sh on .189): the old check would
             still have picked /root with only ~3.7 GB free on rpool. Now:

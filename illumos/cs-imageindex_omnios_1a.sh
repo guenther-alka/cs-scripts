@@ -3,7 +3,7 @@
 # cs-imageindex_omnios_1a.sh
 # Build cs-imageindex on OmniOS / Illumos -- clean start
 #
-# Modeled on rustfs_omnios_1a.sh's proven pattern (system pkgs -> Rust check
+# Modeled on the RustFS build script (illumos/rustfs_omnios_1.0_release.sh, formerly rustfs_omnios_1a.sh) and its proven pattern (system pkgs -> Rust check
 # -> swap check -> fresh clone -> build), but far simpler: cs-imageindex has
 # none of RustFS's exotic deps (no pulsar/mimalloc/jemalloc/aws-lc-rs), so no
 # source patching is expected.

@@ -1,7 +1,12 @@
 #!/bin/bash
 # ============================================================================
-# rustfs_omnios_1a.sh
+# rustfs_omnios_1.0_release.sh
 # Build RustFS on OmniOS / Illumos -- clean start
+#
+# Renamed rustfs_omnios_1a.sh -> rustfs_omnios_1.0_release.sh (2026-09-20): the
+# 1a file had become the beta1 build script, this one builds the 1.0 release (an
+# exact revision can be pinned via RUSTFS_PIN). Older change-history entries
+# below and in illumos/readme.txt still mention the old file name.
 #
 # Renamed from build_rustfs_2a12.sh (2026-08-09), following upstream
 # PR #5853 (merged into rustfs main as commit 9996d567d) which fixed the
@@ -149,7 +154,7 @@
 #   - mimalloc commented out in workspace Cargo.toml
 #
 # Usage:
-#   bash ./rustfs_omnios_1a.sh
+#   bash ./rustfs_omnios_1.0_release.sh
 #
 # Requirements:
 #   - OmniOS installation with at least 16GB RAM and 40GB free disk.
