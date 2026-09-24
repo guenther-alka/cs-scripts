@@ -81,9 +81,12 @@
 #   * a mirror already splits a single stream over both disks -> the 1-vs-N
 #     stream ratio is NOT expected to be N; it is reported, not promised.
 #   * VERDICT (cs_26.09.19.11): the run ends with RESULT verdict (storage-bound | partial |
-#     cache | tool-limited | indicative), verdict_text (sync write, 4k read, seq read with
+#     cache | tool-limited | indicative), verdict_text (sync write, 4k write, 4k read, seq read with
 #     their classes) and verdict_note (why: Windows page cache, tool ceiling, CPU-limited
 #     streams).  The async write is a cache indicator and is not rated.
+#   * 4k SYNC WRITE (cs_rc_26.09.24.14): random 4k overwrites of the 4k file with sync=always, RESULT
+#     4k_iops_write / 4k_write_singleuser / 4k_write_lat_p50_us / 4k_write_lat_p99_us / 4k_write_class;
+#     runs where the 4k read runs (four_k) and syncwrite=yes; seconds = p4w of the profile.
 #   * fast profiles (quick/basic): test file capped at 2 GB, concurrent 1+1 only in
 #     database/fileserver/individual, multiuser 1-stream value = the 4k single-stream read
 #     (same file/blocksize), zfs set sync only when the mode changes.
@@ -153,7 +156,7 @@ $ME -- ZFS pool benchmark, runs ON the machine under test.
           pool=<zpool>        (default: first pool of 'zpool list')
           streams=1|5|auto    (default auto, capped by the vCPU count)
           load=readheavy|writeheavy|balanced
-          four_k=yes|no   write=yes|no   syncwrite=yes|no
+          four_k=yes|no   write=yes|no   syncwrite=yes|no   (four_k = 4k read + 4k sync write)
           mixed=yes|no    multiuser=yes|no
           conc1=yes|no        (concurrent 1+1; default only database/fileserver/individual)
           steady=yes|no   steady_min=45 (TOTAL minutes)  steady_interval=30
@@ -274,14 +277,14 @@ my $RAM_GB = _env_ram_gb();
 # PROFILES -- durations in seconds; streams "auto" = min(vCPU,5), at least 2
 # =============================================================================
 my %PROFILE = (
-    quick       => { p4k => 10, sr => 10, sw => 15, aw => 10, mx => 15, mu => 10, four_k => 1 },
-    basic       => { p4k => 20, sr => 20, sw => 25, aw => 15, mx => 25, mu => 20, four_k => 1 },
-    database    => { p4k => 30, sr => 10, sw => 20, aw => 10, mx => 20, mu => 20, four_k => 1 },
-    fileserver  => { p4k => 30, sr => 30, sw => 20, aw => 15, mx => 30, mu => 20, four_k => 1 },
-    mediaserver => { p4k => 10, sr => 45, sw => 20, aw => 20, mx => 20, mu => 15, four_k => 0 },
-    mailserver  => { p4k => 15, sr => 15, sw => 45, aw => 10, mx => 25, mu => 20, four_k => 1 },
+    quick       => { p4k => 10, p4w => 10, sr => 10, sw => 15, aw => 10, mx => 15, mu => 10, four_k => 1 },
+    basic       => { p4k => 20, p4w => 15, sr => 20, sw => 25, aw => 15, mx => 25, mu => 20, four_k => 1 },
+    database    => { p4k => 30, p4w => 25, sr => 10, sw => 20, aw => 10, mx => 20, mu => 20, four_k => 1 },
+    fileserver  => { p4k => 30, p4w => 15, sr => 30, sw => 20, aw => 15, mx => 30, mu => 20, four_k => 1 },
+    mediaserver => { p4k => 10, p4w => 0,  sr => 45, sw => 20, aw => 20, mx => 20, mu => 15, four_k => 0 },
+    mailserver  => { p4k => 15, p4w => 20, sr => 15, sw => 45, aw => 10, mx => 25, mu => 20, four_k => 1 },
     # steadywrite: ONLY the steady write test (no other phase) -- see the STEADY section below
-    steadywrite => { p4k => 0,  sr => 0,  sw => 0,  aw => 0,  mx => 0,  mu => 0,  four_k => 0, steadyonly => 1 },
+    steadywrite => { p4k => 0,  p4w => 0,  sr => 0,  sw => 0,  aw => 0,  mx => 0,  mu => 0,  four_k => 0, steadyonly => 1 },
 );
 my %PROF_FALLBACK = %{ $PROFILE{basic} };   # 'individual' without explicit keys
 
@@ -723,7 +726,7 @@ sub _worker_read {
 }
 
 sub _worker_write {
-    my ($file, $dur, $bs, $cap) = @_;
+    my ($file, $dur, $bs, $cap, $rnd) = @_;   # $rnd: random 4k overwrite (cs_rc_26.09.24.14)
     my $h = new_hist();
     # '+<' (READ/WRITE), never '>>': with O_APPEND the kernel ignores sysseek()
     # and appends EVERY write, so the wrap-around below never happened and the
@@ -738,7 +741,9 @@ sub _worker_write {
     my $t0 = time();
     # check the phase duration after EVERY large write (a time() call is nothing
     # next to a 1 MB write); small blocks keep the cheap 64-iteration mask
-    my $mask = ($bs >= 262144) ? 0 : 0x3F;
+    my $mask = ($bs >= 262144) ? 0 : ($rnd ? 0x0F : 0x3F);   # random sync 4k is slow -> look at the clock more often
+    my $sz = -s $file; $sz = $cap if !$sz || $sz > $cap;
+    my $blocks = int($sz / $bs); $blocks = 1 if $blocks < 1;
     while (1) {
         my $s = time();
         sysseek($fh, $off, 0);
@@ -747,8 +752,8 @@ sub _worker_write {
         hist_add($h, $us);
         $max = $us if $us > $max;
         if (defined $w) { $bytes += $w; $n++; }
-        $off += $bs;
-        $off = 0 if $off >= $cap;      # wrap -> in-place overwrite, no growth
+        if ($rnd) { $off = int(rand($blocks)) * $bs; }          # random 4k overwrite inside the file
+        else      { $off += $bs; $off = 0 if $off >= $cap; }   # wrap -> in-place overwrite, no growth
         if (($n & $mask) == 0) { last if time() - $t0 >= $dur; }
     }
     close $fh;
@@ -766,10 +771,11 @@ sub _meas {
 
     my @th;
     my $q = $a{seq} ? 1 : 0;
+    my $rn = $a{rand} ? 1 : 0;
     for my $i (1 .. $streams) {
-        my ($k, $f, $d, $b, $c, $sq) = ($a{kind}, $a{file}, $dur, $bs, $cap, $q);
+        my ($k, $f, $d, $b, $c, $sq, $rw) = ($a{kind}, $a{file}, $dur, $bs, $cap, $q, $rn);
         push @th, threads->create(sub {
-            return $k eq 'read' ? _worker_read($f, $d, $b, $sq) : _worker_write($f, $d, $b, $c);
+            return $k eq 'read' ? _worker_read($f, $d, $b, $sq) : _worker_write($f, $d, $b, $c, $rw);
         });
     }
     my ($n, $bytes, $el, $max) = (0, 0, 0, 0);
@@ -1072,6 +1078,7 @@ bhdr('smartctl',  $SMARTCTL =~ /\S/ ? $SMARTCTL : 'n/a');
 bhdr('pools',     join(',', @POOLS) || 'n/a');
 bhdr('phases',    join(',', grep { /\S/ } (
                     $T_FOUR_K ? "4k:$C{p4k}s" : '',
+                    ($T_FOUR_K && $T_SYNC && ($C{p4w} // 0) > 0) ? "4kwrite:$C{p4w}s" : '',
                     ($C{sr} > 0 ? "seqread:$C{sr}s" : ''),
                     $T_SYNC  ? "syncwrite:$C{sw}s" : '',
                     $T_ASYNC ? "asyncwrite:$C{aw}s" : '',
@@ -1218,6 +1225,25 @@ if ($T_FOUR_K && !cancel_requested()) {
     bres('4k_read_class', $CLASS{'4k_read'}, '');
     $M{r4k} = $R4K = $r;
     blog($zs);
+    # cs_rc_26.09.24.14 (Gea: "4k write iops in der summary"): 4k RANDOM SYNC write on the same 4k file
+    # (recordsize=4K, sync=always): the honest small-write number (database / VM / NFS-sync load, SLOG,
+    # power-loss protection).  A 4k ASYNC write would only measure the dirty-data buffer, so it is not run.
+    # sync goes back to 'standard' afterwards so the test file creation below is not slowed down.
+    if ($T_SYNC && ($C{p4w} // 0) > 0 && $file_small =~ /\S/ && !cancel_requested()) {
+        vlog('phase: 4k random sync write (sync=always, recordsize=4K)');
+        set_sync('always');
+        my ($w, $wz) = phase(kind => 'write', file => $file4k, dur => $C{p4w}, bs => 4096,
+                              streams => 1, cap => (-s $file4k), rand => 1);
+        bres('4k_iops_write',       sprintf('%.0f', $w->{iops}), 'iop/s');
+        bres('4k_write_singleuser', sprintf('%.2f', $w->{mbs}),  'MB/s');
+        bres('4k_write_lat_p50_us', sprintf('%.0f', $w->{p50}),  'us');
+        bres('4k_write_lat_p99_us', sprintf('%.0f', $w->{p99}),  'us');
+        $CLASS{'4k_write'} = classify($w, $wz);
+        bres('4k_write_class', $CLASS{'4k_write'}, '');
+        $M{w4k} = $w;
+        blog($wz);
+        set_sync('standard');
+    }
     set_recordsize('128K');
 }
 
@@ -1354,7 +1380,7 @@ if ($T_STEADY && !cancel_requested()) {
 # VERDICT -- the concise statement about the storage (cs_26.09.19.11)
 # =============================================================================
 # ONE rating + ONE line + an optional note, derived only from what was measured and classified.
-# Rated values: sync write, 4k read, seq read.  The async write is a cache indicator and is NOT
+# Rated values: sync write, 4k sync write, 4k read, seq read.  The async write is a cache indicator and is NOT
 # rated.  Ratings (same words as the per-phase classes):
 #   storage-bound  every rated value came from the vdevs (tool-limited reads count as "at least")
 #   partial        part of the rated values did not come (fully) from the vdevs
@@ -1364,14 +1390,14 @@ if ($T_STEADY && !cancel_requested()) {
 sub _lat_txt { my ($us) = @_; return ($us >= 1000) ? sprintf('%.1f ms', $us / 1000) : sprintf('%d us', $us); }
 
 sub verdict {                    # -> (rating, one line, note)   rating '' = nothing rated
-    my %def = (sync => ['sync_write', 'sync write'], r4k => ['4k_read', '4k read'], seq => ['seq_read', 'seq read']);
+    my %def = (sync => ['sync_write', 'sync write'], w4k => ['4k_write', '4k write'], r4k => ['4k_read', '4k read'], seq => ['seq_read', 'seq read']);
     my ($nok, $npart, $ncache, $ntool, $nn) = (0, 0, 0, 0, 0);
     my (@txt, @note);
-    for my $k (qw(sync r4k seq)) {
+    for my $k (qw(sync w4k r4k seq)) {
         my $r = $M{$k} or next;
         my ($ck, $name) = @{ $def{$k} };
         my $c = $CLASS{$ck} // 'n/a';
-        my $v = ($k eq 'r4k')   ? sprintf('%.0f IOPS p99 %s', $r->{iops}, _lat_txt($r->{p99}))
+        my $v = ($k eq 'r4k' || $k eq 'w4k') ? sprintf('%.0f IOPS p99 %s', $r->{iops}, _lat_txt($r->{p99}))
               : ($k eq 'sync')  ? sprintf('%.0f MB/s p99 %s', $r->{mbs}, _lat_txt($r->{p99}))
               :                   sprintf('%.0f MB/s', $r->{mbs});
         $v = "at least $v" if $c eq 'tool-limited';

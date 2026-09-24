@@ -9,7 +9,7 @@ df and (optionally) smartctl. Written in pure Perl (sysseek/sysread/syswrite
 + Time::HiRes): no fio, nothing to install.
 
 Measured per run
-  4k random read IOPS, sequential read, sync write, async write, concurrent
+  4k random read IOPS, 4k random sync write IOPS, sequential read, sync write, async write, concurrent
   read+write, multiuser read (1 vs N streams), optionally a long steady-write
   test with one sample line every 30 s.  Every number carries p50/p99 latency
   and an honest class: storage-bound | cache | cache-influenced | tool-limited.
@@ -18,10 +18,10 @@ The concise statement (RESULT verdict, verdict_text, verdict_note)
   Every finished run ends with ONE rating, ONE line and a note, so the answer to
   "how fast is this storage?" does not need the 40 detail lines:
     verdict       storage-bound | partial | cache | tool-limited | indicative
-    verdict_text  sync write MB/s + p99, 4k read IOPS + p99, seq read MB/s, each with its class
+    verdict_text  sync write MB/s + p99, 4k write IOPS + p99, 4k read IOPS + p99, seq read MB/s, each with its class
     verdict_note  why the rating is what it is (Windows page cache, the tool ceiling of
                   ~80000 4k IOPS, more streams than vCPUs, no scratch dataset / no sync=always)
-  Rated: sync write, 4k read, seq read.  The async write is a cache indicator and is not rated.
+  Rated: sync write, 4k sync write, 4k read, seq read.  The async write is a cache indicator and is not rated.
   storage-bound = the vdevs delivered the numbers (a read at the tool ceiling counts as "at least");
   partial = only part of it did; cache = the numbers are cache speed; tool-limited = every rated
   value hit the tool's ceiling; indicative = no scratch dataset / vdev data, caches are included.
