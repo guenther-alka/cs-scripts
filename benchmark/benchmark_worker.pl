@@ -18,11 +18,11 @@
 #     four_k=yes|no   syncwrite=yes|no   mixed=yes|no   steady=yes|no
 #     conc1=yes|no                     concurrent 1 reader + 1 writer (default: only database,
 #                                      fileserver, individual; the N+N variant always runs)
-#     steady_min=<minutes>             (default 30 = TOTAL minutes of the steady run)
+#     steady_min=<minutes>             (default 45 = TOTAL minutes of the steady run)
 #     steady_interval=<seconds>        (default 30 = sample window)
 #   profile=steadywrite = ONLY the steady write test (cs_26.09.19.9, Gea): three variants
 #     one after the other -- singlestream write | N streams write | concurrent read+write
-#     single stream (1 reader + 1 writer) -- steady_min/3 minutes each (30 -> 10 min each),
+#     single stream (1 reader + 1 writer) -- steady_min/3 minutes each (45 -> 15 min each),
 #     one "steady_sample:" log line per window = the write performance HISTORY that the
 #     napp-it frontend draws as text bars (and stores per run).
 #     rundir=<dir>                     (default: directory of this script)
@@ -156,7 +156,7 @@ $ME -- ZFS pool benchmark, runs ON the machine under test.
           four_k=yes|no   write=yes|no   syncwrite=yes|no
           mixed=yes|no    multiuser=yes|no
           conc1=yes|no        (concurrent 1+1; default only database/fileserver/individual)
-          steady=yes|no   steady_min=30 (TOTAL minutes)  steady_interval=30
+          steady=yes|no   steady_min=45 (TOTAL minutes)  steady_interval=30
           profile=steadywrite: only the steady write test (single | N streams | concurrent r+w)
           filesize_ram=<percent of RAM>   (honoured for profile=individual only)
           rundir=<dir>        (default: the directory this script lives in)
@@ -312,8 +312,8 @@ $T_CONC1 = 1 if $STREAMS < 2;
 my $T_STEADY  = (($P{steady}     // 'no')  =~ /^y/i) ? 1 : 0;
 my $STEADYONLY = $C{steadyonly} ? 1 : 0;       # profile steadywrite: the steady test and NOTHING else
 if ($STEADYONLY) { $T_STEADY = 1; $T_FOUR_K = $T_SYNC = $T_ASYNC = $T_MIXED = $T_MULTI = 0; }
-my $STEADY_MIN = $P{steady_min} // 30;         # TOTAL minutes (steadywrite: split over its 3 variants)
-$STEADY_MIN = 30 unless $STEADY_MIN =~ /^\d+(?:\.\d+)?$/ && $STEADY_MIN > 0;
+my $STEADY_MIN = $P{steady_min} // 45;         # TOTAL minutes (steadywrite: split over its 3 variants)
+$STEADY_MIN = 45 unless $STEADY_MIN =~ /^\d+(?:\.\d+)?$/ && $STEADY_MIN > 0;
 my $STEADY_IV  = $P{steady_interval} // 30;    # 30 s aggregation window (user spec)
 $STEADY_IV = 30 unless $STEADY_IV =~ /^\d+$/ && $STEADY_IV >= 1;
 my $CHECK      = (($P{check}       // 'no')  =~ /^y/i) ? 1 : 0;   # dry run, no I/O
@@ -1402,7 +1402,11 @@ sub verdict {                    # -> (rating, one line, note)   rating '' = not
     push @note, "a read reached the tool ceiling (~$TOOL_IOPS IOPS) - the storage may be faster" if $ntool > 0;
     push @note, "more streams than vCPU ($VCPU): multi-stream values are CPU-limited" if $STREAMS_CLAMPED;
     push @note, 'sync write is not a real sync test here (no sync=always)' if $T_SYNC && !($HAVE_SYNC_PROP && $MEDIA_KIND eq 'dataset');
-    return ($lvl, join(' | ', @txt), join('; ', @note));
+    # cs_26.09.24 (Gea: "tab statt | als trenner"): tab instead of "|" -- the
+    # frontend (benchmarklib.pl bench_group_table) splits this on tab into
+    # separate table columns (sync write / 4k read / seq read) instead of
+    # cramming all three into one cell.
+    return ($lvl, join("\t", @txt), join('; ', @note));
 }
 
 # =============================================================================

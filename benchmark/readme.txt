@@ -91,9 +91,9 @@ Usage
   perl benchmark_worker.pl profile=mailserver syncwrite=yes load=balanced
   perl benchmark_worker.pl profile=quick pool=tank conc1=yes   # add the concurrent 1+1 phase
   perl benchmark_worker.pl name_of_run profile=basic steady=yes steady_min=30
-  perl benchmark_worker.pl profile=steadywrite pool=tank steady_min=30
+  perl benchmark_worker.pl profile=steadywrite pool=tank steady_min=45
       (steadywrite = ONLY the steady write test, 3 variants one after the other: singlestream
-       write | N streams write | concurrent 1 reader + 1 writer, steady_min = TOTAL minutes;
+       write | N streams write | concurrent 1 reader + 1 writer, steady_min = TOTAL minutes (default 45 = 3 x 15 min);
        one "steady_sample:" log line per window = the write performance history)
   perl benchmark_worker.pl check=yes pool=tank   # dry run: resolve env + medium,
                                                  # create nothing (frontend probe)
