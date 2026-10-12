@@ -346,7 +346,8 @@ sub blog {
     print $LOGFH $l, "\n" if $LOGFH;
 }
 sub bhdr  { my ($k, $v) = @_; blog(sprintf("bench_hdr: %-22s = %s", $k, $v)); }
-sub bres  { my ($n, $v, $u) = @_; blog(sprintf("RESULT %-26s = %s %s", $n, $v, $u // '')); }
+my %RV;                 # RESULT name -> value of this run, for the console summary (console_summary())
+sub bres  { my ($n, $v, $u) = @_; $RV{$n} = $v; blog(sprintf("RESULT %-26s = %s %s", $n, $v, $u // '')); }
 sub bdone {
     my ($st, $reason) = @_;
     blog(sprintf("BENCH_DONE %s %s", $st, $reason // ''));
@@ -1436,6 +1437,82 @@ sub verdict {                    # -> (rating, one line, note)   rating '' = not
 }
 
 # =============================================================================
+# CONSOLE SUMMARY -- one value per line, grouped by phase (cs_26.10.12, Gea)
+# =============================================================================
+# Console only (vlog): the values come from the RESULT lines (%RV, filled by bres()), so console and
+# last_benchmark.log cannot differ and the log format stays unchanged.  A group or line is skipped when
+# the phase did not run in this profile.
+sub _hd { my ($title, $key) = @_; return unless defined $RV{$key}; vlog(''); vlog($title); }
+sub _cl {                       # label, sprintf format with %s only, RESULT names (all must exist)
+    my ($label, $fmt, @keys) = @_;
+    for my $k (@keys) { return unless defined $RV{$k}; }
+    vlog(sprintf("  %-16s: $fmt", $label, map { $RV{$_} } @keys));
+}
+
+sub console_summary {
+    my ($vl, $vt, $vn, $secs) = @_;
+    my $n = $STREAMS;
+    vlog('');
+    vlog(sprintf('%-18s: %s (%s%s)', 'Pool', $POOL, $MEDIA_KIND, ($DS =~ /\S/ ? ", $DS" : '')));
+    vlog(sprintf('%-18s: %s, %s MB test file, %s streams, %.0f s', 'Profile', $PROFILE, $want_mb, $STREAMS, $secs));
+
+    _hd('File create', 'file_create_singleuser');
+    _cl('4k file',   '%s MB/s', 'file_create_4k_singleuser');
+    _cl('Main file', '%s MB/s', 'file_create_singleuser');
+
+    _hd('4k random read (1 stream)', '4k_iops_read');
+    _cl('IOPS',        '%s',            '4k_iops_read');
+    _cl('Throughput',  '%s MB/s',       '4k_read_singleuser');
+    _cl('Latency p50/p99', '%s / %s us', '4k_read_lat_p50_us', '4k_read_lat_p99_us');
+    _cl('Class',       '%s',            '4k_read_class');
+
+    _hd('4k random sync write (1 stream)', '4k_iops_write');
+    _cl('IOPS',        '%s',            '4k_iops_write');
+    _cl('Throughput',  '%s MB/s',       '4k_write_singleuser');
+    _cl('Latency p50/p99', '%s / %s us', '4k_write_lat_p50_us', '4k_write_lat_p99_us');
+    _cl('Class',       '%s',            '4k_write_class');
+
+    _hd('Sequential read (1 stream)', 'seq_read_singleuser');
+    _cl('Throughput',  '%s MB/s',       'seq_read_singleuser');
+    _cl('Latency p99', '%s us',         'seq_read_lat_p99_us');
+    _cl('Class',       '%s',            'seq_read_class');
+
+    _hd('Sync write (1 MB blocks)', 'sync_write_singleuser');
+    _cl('Throughput',  '%s MB/s',       'sync_write_singleuser');
+    _cl('IOPS',        '%s',            'sync_write_iops');
+    _cl('Latency p99', '%s ms',         'sync_write_lat_p99_ms');
+    _cl('Class',       '%s',            'sync_write_class');
+
+    _hd('Async write (1 MB blocks, cache indicator)', 'async_write_singleuser');
+    _cl('Throughput',  '%s MB/s',       'async_write_singleuser');
+    _cl('IOPS',        '%s',            'async_write_iops');
+    _cl('Class',       '%s',            'async_write_class');
+
+    _hd('Concurrent read+write (1 reader + 1 writer)', 'conc_read_mbs');
+    _cl('Read',        '%s MB/s (p99 %s us)', 'conc_read_mbs',  'conc_read_lat_p99_us');
+    _cl('Write',       '%s MB/s (p99 %s ms)', 'conc_write_mbs', 'conc_write_lat_p99_ms');
+    _cl('Class',       '%s',            'conc_class');
+
+    _hd("Concurrent read+write ($n readers + $n writers)", 'conc5_read_mbs');
+    _cl('Read',        '%s MB/s (p99 %s us)', 'conc5_read_mbs',  'conc5_read_p99_us');
+    _cl('Write',       '%s MB/s (p99 %s ms)', 'conc5_write_mbs', 'conc5_write_p99_ms');
+    _cl('Class',       '%s',            'conc5_class');
+
+    _hd("Multiuser read (4k, 1 vs $n streams)", 'multiuser_read_1_mbs');
+    _cl('1 stream',    '%s MB/s',       'multiuser_read_1_mbs');
+    _cl("$n streams",  '%s MB/s',       "multiuser_read_${n}_mbs");
+    _cl("$n streams",  '%s IOPS',       "multiuser_read_${n}_iops");
+    _cl('Scaling',     '%s x',          'multiuser_read_ratio');
+    _cl('Class',       '%s',            'multiuser_read_class');
+
+    vlog('');
+    vlog(sprintf('%-18s: %s', 'Verdict', $vl));
+    vlog("  $_") for split /\t/, $vt;
+    vlog("  note: $vn") if $vn =~ /\S/;
+    vlog('');
+}
+
+# =============================================================================
 # SUMMARY
 # =============================================================================
 my $tot = time() - $T0;
@@ -1464,8 +1541,7 @@ unless ($STEADYONLY) {                       # steadywrite has its own tables/ch
         bres('verdict',      $vl, '');
         bres('verdict_text', $vt, '');
         bres('verdict_note', $vn, '') if $vn =~ /\S/;
-        vlog("VERDICT: $vl -- $vt");
-        vlog("         note: $vn") if $vn =~ /\S/;
+        console_summary($vl, $vt, $vn, $tot);
     }
 }
 $DONE = 1;
