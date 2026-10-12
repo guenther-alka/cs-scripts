@@ -25,7 +25,41 @@ The concise statement (RESULT verdict, verdict_text, verdict_note)
   storage-bound = the vdevs delivered the numbers (a read at the tool ceiling counts as "at least");
   partial = only part of it did; cache = the numbers are cache speed; tool-limited = every rated
   value hit the tool's ceiling; indicative = no scratch dataset / vdev data, caches are included.
-  Standalone runs on a terminal print it as "VERDICT: ..." (or add verbose=yes).
+
+Console output (standalone run on a terminal, or add verbose=yes)
+  At the end of a run the result is printed one value per line, grouped by phase, followed by
+  the verdict.  The values are the RESULT lines of the log, so console and log never differ.
+  A group is skipped when its phase did not run in the chosen profile.  Example (shortened):
+
+    Pool              : nvme480 (dataset, nvme480/csbench_auto_20261012_153327)
+    Profile           : basic, 2048 MB test file, 5 streams, 143 s
+
+    4k random read (1 stream)
+      IOPS            : 81393
+      Throughput      : 317.9 MB/s
+      Latency p50/p99 : 50 / 50 us
+      Class           : tool-limited
+
+    Concurrent read+write (5 readers + 5 writers)
+      Read            : 365.2 MB/s (p99 250 us)
+      Write           : 4.8 MB/s (p99 32.0 ms)
+      Class           : storage-bound
+
+    Multiuser read (4k, 1 vs 5 streams)
+      1 stream        : 317.7 MB/s
+      5 streams       : 522.0 MB/s
+      5 streams       : 133626 IOPS
+      Scaling         : 1.64 x
+      Class           : tool-limited
+
+    Verdict           : storage-bound
+      sync write 1104 MB/s p99 2.0 ms (storage-bound)
+      ...
+      note: a read reached the tool ceiling (~80000 IOPS) - the storage may be faster
+
+  Multiuser read (1 vs N streams) shows how well the pool scales with parallel readers: a mirror
+  scales better than RAID-Z.  Multiuser write is not measured separately -- the concurrent
+  N+N phase covers read and write together.
 
 Fast profiles (quick, basic)
   Test file capped at 2 GB (primarycache=metadata makes a RAM-sized file unnecessary),
