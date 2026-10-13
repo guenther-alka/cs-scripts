@@ -90,6 +90,12 @@
 #   * fast profiles (quick/basic): test file capped at 2 GB, concurrent 1+1 only in
 #     database/fileserver/individual, multiuser 1-stream value = the 4k single-stream read
 #     (same file/blocksize), zfs set sync only when the mode changes.
+#   * REMOTE TESTS (cs_rc_26.10.13.10, Gea): remotepath=<mounted SMB/NFS/S3 path> (Windows N:, Linux
+#     /mnt/smb, /mnt/rclone-s3 ...; the mount must exist BEFORE the start).  After the pool tests the same
+#     Perl I/O runs on that path: seq write/read, 4k QD1 read/write with p50/p99, open/close round trip
+#     (all profiles except steadywrite) and, from basic up, QD 4/16, 64K blocks and metadata ops.
+#     remote_filesize=<MB> (default: quick 2048 MB, otherwise 100% of the local RAM, max 50% of the free
+#     space).  RESULT remote_* / perl_ceiling_*; the worker only touches <remotepath>/csbench_<runid>.
 # =============================================================================
 
 use strict;
@@ -162,6 +168,9 @@ $ME -- ZFS pool benchmark, runs ON the machine under test.
           steady=yes|no   steady_min=45 (TOTAL minutes)  steady_interval=30
           profile=steadywrite: only the steady write test (single | N streams | concurrent r+w)
           filesize_ram=<percent of RAM>   (honoured for profile=individual only)
+          remotepath=<path>   mounted SMB/NFS/S3 path (N: or /mnt/smb): remote tests follow the pool tests
+                              (not in profile steadywrite).  remote_filesize=<MB>  (default quick 2048,
+                              otherwise 100% of the local RAM; use 100-150% of the SERVER RAM for exact reads)
           rundir=<dir>        (default: the directory this script lives in)
 check=yes           resolve environment + test medium and exit (NO I/O, no dataset)
           verbose=yes
@@ -320,6 +329,13 @@ $STEADY_MIN = 45 unless $STEADY_MIN =~ /^\d+(?:\.\d+)?$/ && $STEADY_MIN > 0;
 my $STEADY_IV  = $P{steady_interval} // 30;    # 30 s aggregation window (user spec)
 $STEADY_IV = 30 unless $STEADY_IV =~ /^\d+$/ && $STEADY_IV >= 1;
 my $CHECK      = (($P{check}       // 'no')  =~ /^y/i) ? 1 : 0;   # dry run, no I/O
+
+# ---- remote tests (cs_rc_26.10.13.10): remotepath=<mounted SMB/NFS/S3 path>; see remote_run() ----
+my $REMOTE = $P{remotepath} // '';
+$REMOTE =~ s/^\s+|\s+$//g;
+$REMOTE =~ s{[\\/]+$}{} if length($REMOTE) > 3;       # "N:\" and "/" keep their slash
+my $T_REMOTE  = ($REMOTE ne '' && !$STEADYONLY) ? 1 : 0;
+my $REMOTE_MB = (defined $P{remote_filesize} && $P{remote_filesize} =~ /^\d+$/ && $P{remote_filesize} > 0) ? $P{remote_filesize} : 0;
 
 my $POOL = $P{pool} // '';
 
@@ -483,7 +499,7 @@ sub _free_mb {
         }
     } else {
         my $o = _sys("df -Pk \"$p\"");
-        $mb = $1 if $o =~ /^\S+\s+\d+\s+\d+\s+(\d+)/m;
+        $mb = int($1 / 1024) if $o =~ /^\S+\s+\d+\s+\d+\s+(\d+)/m;     # df -Pk is KB (was returned as MB until 2026.10.13)
     }
     return $mb;
 }
@@ -1100,6 +1116,287 @@ if (-f $RUNM) {
     print "already running ($who)\n";
     exit 0;
 }
+# =============================================================================
+# REMOTE TESTS (cs_rc_26.10.13.10, Gea) -- remotepath=<mounted SMB / NFS / S3 path>
+# =============================================================================
+# The pool tests are done; now the SAME Perl I/O (_meas / make_testfile) runs on a path that is mounted
+# over a network protocol (Windows N:, Linux /mnt/smb, /mnt/rclone-s3 ...).  The mount must exist BEFORE
+# the start.  The worker only writes into <remotepath>/csbench_<runid> and removes it again.  Perl only:
+# no native tool (fio/diskspd), so perl_ceiling_* says where Perl itself ends (a result near it is
+# tool-limited, not protocol-limited).  Client CPU is sampled in the middle of a phase.
+my $REMOTE_DIR = '';
+
+sub _remote_free_mb {
+    my ($p) = @_;
+    if ($OSISWIN) {
+        my ($dl) = $p =~ /^([A-Za-z]):/;
+        return 0 unless $dl;                       # UNC path: free space unknown
+        my $c = _sys("powershell -NoProfile -Command \"(Get-PSDrive -Name '$dl').Free\"");
+        return ($c =~ /(\d{7,})/) ? int($1 / 1048576) : 0;
+    }
+    my $o = _sys("df -Pk \"$p\"");
+    return ($o =~ /^\S+\s+\d+\s+\d+\s+(\d+)/m) ? int($1 / 1024) : 0;
+}
+
+# one line: protocol/mount details, so the numbers can be read later (dialect, signing, mount options)
+sub _remote_proto {
+    my ($p) = @_;
+    my $o = '';
+    if ($OSISWIN) {
+        my ($dl) = $p =~ /^([A-Za-z]):/;
+        if ($dl) {
+            $o = _sys("powershell -NoProfile -Command \"\$m = Get-SmbMapping -LocalPath '$dl:' -ErrorAction SilentlyContinue; "
+                    . "if (\$m) { \$c = Get-SmbConnection -ErrorAction SilentlyContinue | Where-Object { \$m.RemotePath -like ('\\\\' + \$_.ServerName + '\\' + \$_.ShareName + '*') } | Select-Object -First 1; "
+                    . "'smb ' + \$m.RemotePath + ' dialect=' + \$c.Dialect + ' signed=' + \$c.Signed + ' encrypted=' + \$c.Encrypted } "
+                    . "else { 'not a mapped network drive (local?)' }\"");
+        } elsif ($p =~ /^\\\\/) { $o = "smb $p (UNC)"; }
+    } else {
+        $o = join('', _sys("findmnt -n -o FSTYPE,SOURCE,OPTIONS -T \"$p\""));
+    }
+    $o =~ s/[\r\n]+/ /g; $o =~ s/^\s+|\s+$//g;
+    return $o =~ /\S/ ? substr($o, 0, 220) : 'unknown';
+}
+
+# what Perl itself can do per stream: 4k random + 1 MB sequential reads of a small, cached LOCAL file
+sub _perl_ceiling {
+    my $f = File::Spec->catfile($TPATH, "bench_ceiling_$$.tmp");
+    open(my $fh, '>', $f) or return ();
+    binmode $fh;
+    my $blk = 'C' x 1048576;
+    syswrite($fh, $blk) for 1 .. 16;
+    close $fh;
+    my @a = _worker_read($f, 1.5, 4096, 0);
+    my @b = _worker_read($f, 1.5, 1048576, 1);
+    unlink $f;
+    return () unless $a[2] && $b[2];
+    return ($a[0] / $a[2], ($b[1] / 1048576) / $b[2]);
+}
+
+# whole-client CPU load in % over ~1 s in the MIDDLE of a phase (runs in its own thread next to the workers)
+sub _cpu_sample {
+    my ($dur) = @_;
+    my $w = $dur / 2 - 0.5; $w = 0 if $w < 0;
+    select(undef, undef, undef, $w);
+    if (!$OSISWIN && open(my $fh, '<', '/proc/stat')) {
+        my $a = <$fh>; close $fh;
+        select(undef, undef, undef, 1);
+        open($fh, '<', '/proc/stat') or return 'n/a';
+        my $b = <$fh>; close $fh;
+        my @x = split(' ', $a // ''); my @y = split(' ', $b // '');
+        shift @x; shift @y;
+        return 'n/a' if @x < 5 || @y < 5;
+        my ($tx, $ty) = (0, 0);
+        $tx += ($_ // 0) for @x[0 .. ($#x < 7 ? $#x : 7)];
+        $ty += ($_ // 0) for @y[0 .. ($#y < 7 ? $#y : 7)];
+        my $dt = $ty - $tx;
+        return 'n/a' if $dt <= 0;
+        my $di = ($y[3] + ($y[4] // 0)) - ($x[3] + ($x[4] // 0));
+        return sprintf('%.0f', 100 * (1 - $di / $dt));
+    }
+    if ($OSISWIN) { my $c = cpu_load(); return $1 if $c =~ /(\d+)/; }
+    return 'n/a';
+}
+
+# a measurement + the CPU sample of the same phase
+sub rphase {
+    my (%a) = @_;
+    my $t = $HAVE_THREADS ? threads->create(sub { _cpu_sample($a{dur}) }) : undef;
+    my $r = _meas(%a);
+    my $c = 'n/a';
+    if ($t) { my @x = $t->join(); $c = $x[0] // 'n/a'; }
+    return ($r, $c);
+}
+
+# open + close of an EXISTING file: the pure protocol round trip (a client may answer from its handle cache)
+sub _remote_oc {
+    my ($file, $dur) = @_;
+    my $h = new_hist();
+    my ($n, $t0) = (0, time());
+    while (time() - $t0 < $dur) {
+        my $s = time();
+        open(my $fh, '<', $file) or last;
+        close $fh;
+        hist_add($h, (time() - $s) * 1e6);
+        $n++;
+    }
+    my $el = time() - $t0; $el = 0.001 if $el <= 0;
+    return { ops => $n / $el, p50 => hist_pct($h, 50), p99 => hist_pct($h, 99) };
+}
+
+# $n small files: create (1 KB) / stat / readdir / unlink, operations per second of each pass
+sub _remote_meta {
+    my ($dir, $n) = @_;
+    my %r;
+    my $blk = 'm' x 1024;
+    my ($t, $c, $dt) = (time(), 0, 0);
+    for my $i (1 .. $n) {
+        open(my $fh, '>', File::Spec->catfile($dir, "m_$i.tmp")) or last;
+        binmode $fh; syswrite($fh, $blk); close $fh;
+        $c++;
+    }
+    $dt = time() - $t; $dt = 0.001 if $dt <= 0; $r{create} = $c / $dt;
+    ($t, $c) = (time(), 0);
+    for my $i (1 .. $n) { my @s = stat(File::Spec->catfile($dir, "m_$i.tmp")); $c++ if @s; }
+    $dt = time() - $t; $dt = 0.001 if $dt <= 0; $r{stat} = $c / $dt;
+    $t = time(); my @e = ();
+    if (opendir(my $dh, $dir)) { @e = grep { !/^\.\.?$/ } readdir($dh); closedir $dh; }
+    $dt = time() - $t; $dt = 0.001 if $dt <= 0; $r{readdir} = scalar(@e) / $dt;
+    ($t, $c) = (time(), 0);
+    for my $i (1 .. $n) { $c++ if unlink(File::Spec->catfile($dir, "m_$i.tmp")); }
+    $dt = time() - $t; $dt = 0.001 if $dt <= 0; $r{delete} = $c / $dt;
+    return \%r;
+}
+
+# removes ONLY the worker's own folder <remotepath>/csbench_<runid> (flat: files only)
+sub rm_remote {
+    return unless $REMOTE_DIR =~ /\S/ && -d $REMOTE_DIR;
+    if (opendir(my $dh, $REMOTE_DIR)) {
+        my @f = grep { !/^\.\.?$/ } readdir($dh);
+        closedir $dh;
+        unlink File::Spec->catfile($REMOTE_DIR, $_) for @f;
+    }
+    rmdir $REMOTE_DIR;
+}
+
+sub remote_run {
+    my $R = sub { my ($n, $v, $u) = @_; bres($n, $v, $u); vlog(sprintf('  %-28s %s %s', $n, $v, $u // '')); };
+    vlog('');
+    vlog("REMOTE TESTS  ($REMOTE)");
+    my $proto = _remote_proto($REMOTE);
+    bhdr('remotepath',   $REMOTE);
+    bhdr('remote_proto', $proto);
+    vlog("  protocol: $proto");
+    if ($proto =~ /^(?:zfs|ext\d|xfs|btrfs|ntfs|apfs|tmpfs|not a mapped)/i) {
+        blog("bench_note: remotepath looks LOCAL ($proto) -- the numbers show a local filesystem, not a network protocol");
+    }
+    unless (-d $REMOTE && -w $REMOTE) {
+        blog("bench_note: remotepath '$REMOTE' is not a writable directory -- remote tests skipped");
+        $R->('remote_status', 'skipped', '(path not writable)');
+        return;
+    }
+    my $dir = File::Spec->catdir($REMOTE, "csbench_$RUNID");
+    unless (mkdir $dir) {
+        blog("bench_note: cannot create '$dir' ($!) -- remote tests skipped");
+        $R->('remote_status', 'skipped', '(cannot create folder)');
+        return;
+    }
+    $REMOTE_DIR = $dir;
+
+    # test file size: remote_filesize, quick = 2048 MB (fast, reads may be cached), otherwise 100% of the
+    # LOCAL RAM; never more than 50% of the free space
+    my ($mb, $why);
+    if    ($REMOTE_MB)          { ($mb, $why) = ($REMOTE_MB, 'remote_filesize'); }
+    elsif ($PROFILE eq 'quick') { ($mb, $why) = (2048, 'quick default'); }
+    else                        { ($mb, $why) = (int($RAM_GB * 1024), '100% of the local RAM'); }
+    if ($mb < 256 && !$REMOTE_MB) { $mb = 2048; $why = 'default (local RAM unknown)'; }
+    my $free = _remote_free_mb($REMOTE);
+    if ($free > 0 && $mb > int($free * 0.5)) {
+        $mb = int($free * 0.5);
+        blog("bench_note: remote test file clamped to 50% of the free space ($free MB free)");
+    } elsif ($free <= 0) {
+        blog("bench_note: free space of $REMOTE unknown -- not checked");
+    }
+    $mb = 64 if $mb < 64;
+    my $bytes = $mb * 1048576;
+    bhdr('remote_filesize', "$mb MB ($why, free=${free}MB)");
+    $R->('remote_filesize_mb', $mb, 'MB');
+
+    my ($c4, $c1) = _perl_ceiling();
+    if (defined $c4) {
+        $R->('perl_ceiling_4k_iops', sprintf('%.0f', $c4), 'iop/s (1 stream, cached local file)');
+        $R->('perl_ceiling_1m_mbs',  sprintf('%.0f', $c1), 'MB/s (1 stream, cached local file)');
+    }
+    return if cancel_requested();
+
+    my $file = File::Spec->catfile($dir, 'bench_remote.dat');
+    my $cmbs = make_testfile($file, $mb);
+    unless (-s $file) {
+        my $err = '';
+        if (open(my $pf, '>>', $file)) { close $pf; $err = 'file created but empty -- write failed'; } else { $err = "$!"; }
+        blog("bench_note: cannot create the remote test file ($err) -- remote tests skipped");
+        $R->('remote_status', 'skipped', '(cannot write the test file)');
+        return;
+    }
+    $R->('remote_create_mbs', sprintf('%.1f', $cmbs), 'MB/s (first write of the test file, 1 stream)');
+
+    my ($r, $cpu);
+    if (($C{sw} // 0) > 0 && !cancel_requested()) {
+        ($r, $cpu) = rphase(kind => 'write', file => $file, dur => $C{sw}, bs => 1048576, streams => 1, cap => $bytes);
+        $R->('remote_seq_write_mbs',     sprintf('%.1f', $r->{mbs}), 'MB/s');
+        $R->('remote_cpu_seq_write_pct', $cpu, '% client CPU (mid-phase)');
+    }
+    if (($C{sr} // 0) > 0 && !cancel_requested()) {
+        ($r, $cpu) = rphase(kind => 'read', file => $file, dur => $C{sr}, bs => 1048576, streams => 1, seq => 1);
+        $R->('remote_seq_read_mbs',     sprintf('%.1f', $r->{mbs}), 'MB/s');
+        $R->('remote_cpu_seq_read_pct', $cpu, '% client CPU (mid-phase)');
+    }
+    if (($C{p4k} // 0) > 0 && !cancel_requested()) {
+        ($r, $cpu) = rphase(kind => 'read', file => $file, dur => $C{p4k}, bs => 4096, streams => 1);
+        $R->('remote_4k_read_iops',    sprintf('%.0f', $r->{iops}), 'iop/s (QD1)');
+        $R->('remote_4k_read_p50_ms',  sprintf('%.2f', $r->{p50} / 1000), 'ms');
+        $R->('remote_4k_read_p99_ms',  sprintf('%.2f', $r->{p99} / 1000), 'ms');
+        $R->('remote_cpu_4k_read_pct', $cpu, '% client CPU (mid-phase)');
+    }
+    if (($C{p4w} // 0) > 0 && !cancel_requested()) {
+        $r = _meas(kind => 'write', file => $file, dur => $C{p4w}, bs => 4096, streams => 1, cap => $bytes, rand => 1);
+        $R->('remote_4k_write_iops',   sprintf('%.0f', $r->{iops}), 'iop/s (QD1, client write-back cache)');
+        $R->('remote_4k_write_p99_ms', sprintf('%.2f', $r->{p99} / 1000), 'ms');
+    }
+    if (!cancel_requested()) {
+        wd_arm('remote open/close', 5 + $WD_GRACE);
+        my $oc = _remote_oc($file, 5);
+        wd_arm('between phases', $WD_GRACE);
+        $R->('remote_openclose_ops',    sprintf('%.0f', $oc->{ops}), 'ops/s (open+close of an existing file)');
+        $R->('remote_openclose_p99_ms', sprintf('%.2f', $oc->{p99} / 1000), 'ms');
+    }
+
+    # from basic up: parallelism, block size and metadata (quick stays quick)
+    if ($PROFILE ne 'quick') {
+        if ($HAVE_THREADS) {
+            for my $q (4, 16) {
+                last if cancel_requested();
+                $r = _meas(kind => 'read', file => $file, dur => 8, bs => 4096, streams => $q);
+                $R->("remote_qd${q}_iops",   sprintf('%.0f', $r->{iops}), "iop/s (4k read, $q streams)");
+                $R->("remote_qd${q}_p99_ms", sprintf('%.2f', $r->{p99} / 1000), 'ms');
+            }
+        } else {
+            blog('bench_note: QD 4/16 not run -- no threads');
+        }
+        if (!cancel_requested()) {
+            $r = _meas(kind => 'read', file => $file, dur => 8, bs => 65536, streams => 1, seq => 1);
+            $R->('remote_seq_read_64k_mbs', sprintf('%.1f', $r->{mbs}), 'MB/s');
+            $r = _meas(kind => 'write', file => $file, dur => 8, bs => 65536, streams => 1, cap => $bytes);
+            $R->('remote_seq_write_64k_mbs', sprintf('%.1f', $r->{mbs}), 'MB/s');
+        }
+        if (!cancel_requested()) {
+            wd_arm('remote metadata', $WD_GRACE + 120);
+            my $m = _remote_meta($dir, 500);
+            wd_arm('between phases', $WD_GRACE);
+            $R->('remote_meta_create_ops',  sprintf('%.0f', $m->{create}),  'files/s (1 KB each)');
+            $R->('remote_meta_stat_ops',    sprintf('%.0f', $m->{stat}),    'stat/s (the client may cache attributes)');
+            $R->('remote_meta_readdir_ops', sprintf('%.0f', $m->{readdir}), 'entries/s');
+            $R->('remote_meta_delete_ops',  sprintf('%.0f', $m->{delete}),  'files/s');
+        }
+    }
+
+    # notes: what the numbers can and cannot say
+    blog("bench_note: remote READ values may be cache-influenced -- test file $mb MB is smaller than the local RAM ($RAM_GB GB)")
+        if $mb < $RAM_GB * 1024;
+    blog('bench_note: the cache of the SERVER (ARC) is not known to the worker -- for a remote server with more RAM set remote_filesize to 100-150% of ITS RAM');
+    my @near;
+    push @near, 'remote_4k_read_iops' if defined $c4 && $c4 > 0 && ($RV{remote_4k_read_iops} // 0) > 0.5 * $c4;
+    if (defined $c1 && $c1 > 0) {
+        for my $k (qw(remote_seq_read_mbs remote_seq_write_mbs)) { push @near, $k if ($RV{$k} // 0) > 0.5 * $c1; }
+    }
+    blog('bench_note: near the Perl ceiling (' . join(', ', @near) . ') -- tool-limited, a native tool (fio/diskspd) shows more') if @near;
+
+    wd_arm('remote cleanup', $WD_GRACE);
+    rm_remote();
+    $REMOTE_DIR = '';
+    wd_arm('between phases', $WD_GRACE);
+    $R->('remote_status', 'ok', '');
+}
+
 my $DONE  = 0;
 my $OWNER = 0;          # 1 once THIS process wrote the marker.  END blocks are registered at compile time, so
                         # without this a second start ("already running" -> exit 0 above) ran the END block and
@@ -1109,6 +1406,9 @@ END {
   if ($OWNER) {
     $WD_FIN = $DONE ? 1 : 2;                       # tell the watchdog what to write if the cleanup hangs
     wd_arm('cleanup (zfs destroy)', 120);          # a blocked "zfs destroy" must not keep the marker forever
+    wd_arm('cleanup (remote files)', 120);
+    eval { rm_remote(); };
+    wd_arm('cleanup (zfs destroy)', 120);
     eval { rm_media() if $TESTDIR =~ /\S/; };
     if (!$DONE && $LOGFH) { bdone('error', 'aborted (worker exited or was cancelled)'); }
     unlink $RUNM;
@@ -1154,6 +1454,7 @@ bhdr('phases',    join(',', grep { /\S/ } (
                     $T_MIXED ? ("mixed(" . ($T_CONC1 ? "1+1," : '') . (($STREAMS >= 2) ? "${STREAMS}+${STREAMS}" : '')
                                 . "):$C{mx}s each") : '',
                     $T_MULTI ? "multiuser:$C{mu}s x$STREAMS" : '',
+                    $T_REMOTE ? "remote:$REMOTE" : '',
                     $T_STEADY ? ($STEADYONLY ? "steadywrite:single+${STREAMS}streams+conc,${STEADY_MIN}min total/${STEADY_IV}s"
                                              : "steady:${STEADY_MIN}min/${STEADY_IV}s") : '')));
 bhdr('steady_min',      $STEADY_MIN) if $T_STEADY;
@@ -1187,6 +1488,11 @@ if ($CHECK) {
     my $hc = (_sys("zfs get -H -o property primarycache $POOL") =~ /primarycache/) ? 'yes' : 'NO';
     my $hs = (_sys("zfs get -H -o property sync $POOL") =~ /\bsync\b/) ? 'yes' : 'NO';
     blog("check: props        = primarycache/secondarycache=$hc sync=$hs (probed on $POOL)");
+    if ($REMOTE ne '') {
+        blog("check: remotepath   = $REMOTE (" . (-d $REMOTE ? (-w $REMOTE ? 'writable directory' : 'NOT writable') : 'NOT FOUND')
+           . ", free_mb=" . _remote_free_mb($REMOTE) . ")" . ($STEADYONLY ? '  -- ignored in profile steadywrite' : ''));
+        blog("check: remote_proto  = " . _remote_proto($REMOTE));
+    }
     blog("CHECK_DONE ok (nothing created, no I/O)");
     print "CHECK_DONE ok (nothing created, no I/O)\n";
     $DONE = 1;                       # no "aborted" line for a dry check
@@ -1587,6 +1893,9 @@ sub console_summary {
 # =============================================================================
 # SUMMARY
 # =============================================================================
+if ($T_REMOTE && !cancel_requested()) { remote_run(); }
+elsif ($REMOTE ne '' && $STEADYONLY) { blog('bench_note: remotepath ignored in profile steadywrite (the steady write is a pool test)'); }
+
 my $tot = time() - $T0;
 if (cancel_requested()) {
     bres('bench_cancelled', 'yes', "after ${tot}s");

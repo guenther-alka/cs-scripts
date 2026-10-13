@@ -132,6 +132,8 @@ Usage
   perl benchmark_worker.pl check=yes pool=tank   # dry run: resolve env + medium,
                                                  # create nothing (frontend probe)
   perl benchmark_worker.pl help=yes
+  perl benchmark_worker.pl profile=basic pool=tank remotepath=/mnt/smb      # + remote tests after the pool tests
+  perl benchmark_worker.pl profile=basic pool=tank remotepath=N:\ remote_filesize=65536
 
   profile=quick ~1-1.5 min, the others 5-10 min.  Without a runid the id is
   generated as auto_YYYYMMDD_HHMMSS.  Result: last_benchmark.log next to the
@@ -141,6 +143,28 @@ Usage
     BENCH_DONE ok|error ...   (last line = run finished)
   Only one benchmark per machine: a fixed "benchmark.running" marker makes a
   second run answer "already running".  Cancel: create benchmark_<runid>.cancel.
+
+Remote tests (SMB / NFS / S3) -- remotepath=
+  remotepath=<path>   mounted SMB/NFS/S3 path (Windows N:, Linux /mnt/smb, /mnt/nfs, /mnt/rclone-s3).  The mount
+                      must exist BEFORE the start, the worker mounts nothing.  After the pool tests the same Perl
+                      I/O runs on that path (not in profile steadywrite):
+                        seq write/read (1 MB) with client CPU %, 4k random read/write QD1 with p50/p99,
+                        open/close round trip, perl_ceiling (what Perl itself can do per stream);
+                        from profile basic up also QD 4/16, 64K blocks and metadata (create/stat/readdir/delete).
+                      RESULT remote_* and perl_ceiling_*; header remotepath / remote_proto (protocol, SMB dialect;
+                      on Windows the dialect needs an elevated worker).  Only <remotepath>/csbench_<runid> is
+                      written and it is removed again.
+  remote_filesize=<MB>  test file size.  Default: profile quick 2048 MB (fast; reads may be served from cache,
+                      the write values are the meaningful ones), every other profile 100% of the LOCAL RAM, never
+                      more than 50% of the free space.  A remote SERVER with more RAM keeps part of the file in
+                      its cache (ARC): for exact read values set remote_filesize to 100-150% of the RAM of the
+                      larger machine (usually the server).
+  Notes: Perl only -- for 25G+ / SMB Direct a result near perl_ceiling_* is tool-limited (the log says so), use
+         fio/diskspd for exact values.  Set the share's dataset to compression=off.  The client cache cannot be
+         switched off over a protocol: open/close and stat values may come from it.  A Samba GUEST mount may create
+         a folder but not a file in it (owner nobody, mode 755): mount with credentials or use a share with
+         "force user".  Tested: cifs loopback on Linux (profile=basic), Windows mapped drive (check) and a full
+         run with a local folder; NFS, rclone-S3 and an elevated Windows run are not tested yet.
 
 Integration
   The SAME file (same name, same content) ships in the napp-it cs distribution
