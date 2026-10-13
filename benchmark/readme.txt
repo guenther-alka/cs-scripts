@@ -134,6 +134,7 @@ Usage
   perl benchmark_worker.pl help=yes
   perl benchmark_worker.pl profile=basic pool=tank remotepath=/mnt/smb      # + remote tests after the pool tests
   perl benchmark_worker.pl profile=basic pool=tank remotepath=N:\ remote_filesize=65536
+  perl benchmark_worker.pl profile=basic remoteonly=yes remotepath=/mnt/smb remote_filesize=8192 start_at=14:30:00   # multi-client
 
   profile=quick ~1-1.5 min, the others 5-10 min.  Without a runid the id is
   generated as auto_YYYYMMDD_HHMMSS.  Result: last_benchmark.log next to the
@@ -170,6 +171,41 @@ Remote tests (SMB / NFS / S3) -- remotepath=
          "force user".  Tested: cifs loopback on Linux (profile=basic), Windows mapped drive (check) and a full
          run with a local folder; NFS, rclone-S3 and an elevated Windows run are not tested yet.
 
+Real multi-user test -- several clients at the same time (remoteonly=, start_at=)
+  The streams of the remote multiuser/concurrent tests are threads on ONE mount (one SMB session).  A real
+  multi-user test runs the worker on SEVERAL machines at the same moment, each with its own mount (own session,
+  optionally its own user) of the SAME share.
+  remoteonly=yes        no pool tests, no scratch dataset: ONLY the remote tests (needs remotepath, not for steadywrite).
+  start_at=<HH:MM[:SS]> local clock (within +-1 h of now).  The worker prepares (creates its test file), waits until
+                        that time and then starts the measured phases: the same start_at on all clients = the same
+                        moment.  Choose it later than the slowest preparation (file size / write speed + ~20 s); a
+                        client that was not ready logs RESULT remote_start_late_s (= not aligned).  RESULT
+                        remote_phases_start_epoch = unix time of the first measured phase (compare the clients; the
+                        clocks must be NTP-synchronised).
+  Per client: the share mounted, perl + the SAME benchmark_worker.pl version, free space for clients x remote_filesize,
+  the same profile (basic) and the same remote_filesize, a writable rundir.
+  A. By hand (PuTTY / ssh / RDP, one session per client)
+     1. Check the clocks on all clients (Linux: date, Windows: w32tm /query /status) and pick start_at = now + 5 min or later.
+     2. In EVERY session the same command, then Enter in all of them:
+          perl benchmark_worker.pl profile=basic remoteonly=yes remotepath=/mnt/smb remote_filesize=8192 start_at=14:30:00
+        (Windows: remotepath=N:\ ...).  Every client writes last_benchmark.log next to the script (rundir=<dir> to change).
+     3. Collect the logs of all clients and compare: the SUM of remote_seq_write_mbs / remote_seq_read_mbs / remote_4k_*_iops
+        is what the server delivers to N users, the single values show how the load is shared.  Compare with a run on ONE
+        client: the aggregate stays the same -> server/network is the limit; it grows -> the single client was the limit.
+  B. With the AI (Claude with shell access: ssh/plink to the clients, e.g. Claude Code or the desktop app)
+     Give it the client list (ssh-reachable), the share and the mount path per client, the parameters and the task of
+     steps 1-3.  Example:
+       "Run the benchmark worker as a multi-client test: clients .185, .187 and my-w11, share //192.168.2.112/data
+        mounted at /mnt/smb (Windows N:), profile=basic remoteonly=yes remote_filesize=8192, start 5 minutes from now.
+        Copy benchmark_worker.pl to every client, start it on all clients in parallel with the same start_at, wait for
+        BENCH_DONE, fetch every last_benchmark.log and give me one table: per client and sum of seq write/read MB/s,
+        4k iops, p99, the spread of remote_phases_start_epoch and the clients that started late."
+     The AI starts the commands in the background (nohup / start), polls the logs, fetches them and builds the table.
+     It needs ssh keys or credentials for the clients and your OK to copy the worker and start it.
+  Notes: every client writes into its OWN folder csbench_<runid> and removes it again; the test files of all clients
+         together must fit into the free space.  Different hardware or mounts (SMB dialect, multichannel) change the
+         picture -- the header remote_proto of every client says what was used.  Built and syntax-checked, NOT live-tested
+         yet (2026.10.13).
 Integration
   The SAME file (same name, same content) ships in the napp-it cs distribution
   as data/menues/_lib/scripts/bench/benchmark_worker.pl and is deployed to a

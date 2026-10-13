@@ -98,6 +98,12 @@
 #     mount = one SMB session), QD16, 64K blocks and metadata ops.
 #     remote_filesize=<MB> (default: quick 2048 MB, otherwise 100% of the local RAM, max 50% of the free
 #     space).  RESULT remote_* / perl_ceiling_*; the worker only touches <remotepath>/csbench_<runid>.
+#   * REAL MULTI-CLIENT TEST (cs_rc_26.10.13.13, Gea; built, NOT live-tested): remoteonly=yes = no pool tests and no scratch
+#     dataset, ONLY the remote tests (needs remotepath, not for profile steadywrite).  start_at=<HH:MM[:SS]> (local clock, within
+#     +-1 h of now): the worker prepares (creates its test file), then waits until that time and starts the measured phases;
+#     started on N clients with the same start_at (NTP-synchronised) the phases run at the same moment.  RESULT
+#     remote_phases_start_epoch (unix time of the first measured phase) and remote_start_late_s (start_at was already over
+#     when the file was ready = NOT aligned).  Evaluation: howto.ai/benchmark.info section 13 and the readme.
 # =============================================================================
 
 use strict;
@@ -173,6 +179,9 @@ $ME -- ZFS pool benchmark, runs ON the machine under test.
           remotepath=<path>   mounted SMB/NFS/S3 path (N: or /mnt/smb): remote tests follow the pool tests
                               (not in profile steadywrite).  remote_filesize=<MB>  (default quick 2048,
                               otherwise 100% of the local RAM; use 100-150% of the SERVER RAM for exact reads)
+          remoteonly=yes     ONLY the remote tests (no pool tests, no scratch dataset); needs remotepath
+          start_at=<HH:MM[:SS]>  local clock: prepare, then wait and start the measured remote phases at that time
+                              (several clients with the same start_at = a real multi-client test, NTP needed)
           rundir=<dir>        (default: the directory this script lives in)
 check=yes           resolve environment + test medium and exit (NO I/O, no dataset)
           verbose=yes
@@ -338,6 +347,9 @@ $REMOTE =~ s/^\s+|\s+$//g;
 $REMOTE =~ s{[\\/]+$}{} if length($REMOTE) > 3;       # "N:\" and "/" keep their slash
 my $T_REMOTE  = ($REMOTE ne '' && !$STEADYONLY) ? 1 : 0;
 my $REMOTE_MB = (defined $P{remote_filesize} && $P{remote_filesize} =~ /^\d+$/ && $P{remote_filesize} > 0) ? $P{remote_filesize} : 0;
+my $REMOTEONLY = (($P{remoteonly} // 'no') =~ /^y/i) ? 1 : 0;   # no pool tests, no scratch dataset: ONLY the remote tests
+my $START_AT   = $P{start_at} // '';                            # HH:MM[:SS], local clock: the measured remote phases start then
+my $START_AT_EPOCH = 0;                                         # resolved at the start (see below), waited for in remote_run()
 
 my $POOL = $P{pool} // '';
 
@@ -1128,6 +1140,24 @@ if (-f $RUNM) {
 # tool-limited, not protocol-limited).  Client CPU is sampled in the middle of a phase.
 my $REMOTE_DIR = '';
 
+# HH:MM[:SS] -> (epoch, seconds from now) of the occurrence of that local time nearest to now (yesterday/today/tomorrow)
+sub _start_at_epoch {
+    my ($hms) = @_;
+    return () unless defined $hms && $hms =~ /^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$/;
+    my ($h, $m, $s) = ($1, $2, $3 // 0);
+    return () if $h > 23 || $m > 59 || $s > 59;
+    my $now = time();
+    my @lt = localtime($now);
+    my ($best, $bd);
+    for my $dd (-1, 0, 1) {
+        my $t = POSIX::mktime($s, $m, $h, $lt[3] + $dd, $lt[4], $lt[5]);
+        next unless defined $t;
+        my $d = $t - $now;
+        ($best, $bd) = ($t, $d) if !defined $bd || abs($d) < abs($bd);
+    }
+    return defined $best ? ($best, $bd) : ();
+}
+
 sub _remote_free_mb {
     my ($p) = @_;
     if ($OSISWIN) {
@@ -1321,6 +1351,23 @@ sub remote_run {
     }
     $R->('remote_create_mbs', sprintf('%.1f', $cmbs), 'MB/s (first write of the test file, 1 stream)');
 
+    # start_at: the test file is ready; wait for the common start time of all clients (multi-client test)
+    if ($START_AT_EPOCH) {
+        my $d = $START_AT_EPOCH - time();
+        if ($d > 0) {
+            vlog(sprintf('  waiting %.0f s for start_at %s', $d, $START_AT));
+            wd_arm('waiting for start_at', $d + $WD_GRACE);
+            while (time() < $START_AT_EPOCH) {
+                last if cancel_requested();
+                select(undef, undef, undef, (($START_AT_EPOCH - time()) > 1) ? 0.5 : 0.01);
+            }
+            wd_arm('between phases', $WD_GRACE);
+        } else {
+            $R->('remote_start_late_s', sprintf('%.1f', -$d), 's (start_at was over when the file was ready -- NOT aligned with the other clients)');
+        }
+    }
+    $R->('remote_phases_start_epoch', sprintf('%.3f', time()), 's (unix time of the first measured phase, local clock of this client)');
+
     my ($r, $cpu, $r4k);
     if (($C{sw} // 0) > 0 && !cancel_requested()) {
         ($r, $cpu) = rphase(kind => 'write', file => $file, dur => $C{sw}, bs => 1048576, streams => 1, cap => $bytes);
@@ -1461,10 +1508,19 @@ if (($P{wdtest} // '') =~ /^y/i) {                 # self-test: block here on pu
 my $VERBOSE = (-t STDOUT) || (($P{verbose} // '') =~ /^y/i) ? 1 : 0;
 sub vlog { print @_, "\n" if $VERBOSE; }
 
+# start_at (cs_rc_26.10.13.13): the day is resolved NOW (nearest occurrence of HH:MM[:SS] within +-1 h), the wait happens
+# in remote_run() AFTER the test file is created -- so the preparation of all clients may take different times
+if ($START_AT =~ /\S/) {
+    my ($t, $d) = _start_at_epoch($START_AT);
+    if    (!defined $t)  { blog("bench_note: start_at '$START_AT' not understood (use HH:MM or HH:MM:SS, local clock) -- ignored"); }
+    elsif (abs($d) > 3600) { blog("bench_note: start_at '$START_AT' is not within +-1 h of now -- ignored"); }
+    else                 { $START_AT_EPOCH = $t; }
+}
+
 unless ($POOL =~ /\S/) { $POOL = $POOLS[0] // ''; }
 
 bhdr('run_id',    $RUNID);
-bhdr('pool',      $POOL =~ /\S/ ? $POOL : '(none -> folder)');
+bhdr('pool',      $REMOTEONLY ? '(remoteonly -- no pool tests)' : ($POOL =~ /\S/ ? $POOL : '(none -> folder)'));
 bhdr('profile',   $PROFILE);
 bhdr('load',      $LOAD);
 bhdr('vCPU',      $VCPU);
@@ -1475,7 +1531,7 @@ bhdr('perl',      "$^V");
 bhdr('threads',   $HAVE_THREADS ? 'yes' : 'no (serial fallback)');
 bhdr('smartctl',  $SMARTCTL =~ /\S/ ? $SMARTCTL : 'n/a');
 bhdr('pools',     join(',', @POOLS) || 'n/a');
-bhdr('phases',    join(',', grep { /\S/ } (
+bhdr('phases',    $REMOTEONLY ? "remote:$REMOTE (remoteonly)" : join(',', grep { /\S/ } (
                     $T_FOUR_K ? "4k:$C{p4k}s" : '',
                     ($T_FOUR_K && $T_SYNC && ($C{p4w} // 0) > 0) ? "4kwrite:$C{p4w}s" : '',
                     ($C{sr} > 0 ? "seqread:$C{sr}s" : ''),
@@ -1522,10 +1578,32 @@ if ($CHECK) {
         blog("check: remotepath   = $REMOTE (" . (-d $REMOTE ? (-w $REMOTE ? 'writable directory' : 'NOT writable') : 'NOT FOUND')
            . ", free_mb=" . _remote_free_mb($REMOTE) . ")" . ($STEADYONLY ? '  -- ignored in profile steadywrite' : ''));
         blog("check: remote_proto  = " . _remote_proto($REMOTE));
+        blog("check: remoteonly    = " . ($REMOTEONLY ? 'yes (no pool tests, no scratch dataset)' : 'no'));
+        if ($START_AT =~ /\S/) {
+            my ($t, $d) = _start_at_epoch($START_AT);
+            blog("check: start_at      = $START_AT -> " . (defined $t ? ((abs($d) <= 3600) ? sprintf('%s (in %.0f s)', strftime('%Y-%m-%d %H:%M:%S', localtime($t)), $d) : 'NOT within +-1 h of now (would be ignored)') : 'not understood (would be ignored)'));
+        }
     }
     blog("CHECK_DONE ok (nothing created, no I/O)");
     print "CHECK_DONE ok (nothing created, no I/O)\n";
     $DONE = 1;                       # no "aborted" line for a dry check
+    exit 0;
+}
+
+# remoteonly=yes (cs_rc_26.10.13.13): no pool tests, no scratch dataset -- ONLY the remote tests (multi-client test)
+if ($REMOTEONLY) {
+    if (!$T_REMOTE) {
+        blog('bench_note: remoteonly=yes needs remotepath=<path> and a profile other than steadywrite');
+        $DONE = 1;
+        bdone('error', 'remoteonly without remotepath');
+        exit 0;
+    }
+    remote_run();
+    my $rtot = time() - $T0;
+    bhdr('duration_s', sprintf('%.0f', $rtot));
+    $DONE = 1;
+    bdone('ok', sprintf('%.0fs profile=%s remoteonly remotepath=%s', $rtot, $PROFILE, $REMOTE));
+    vlog("BENCH_DONE ok (${rtot}s)  log=$LOG");
     exit 0;
 }
 
