@@ -672,6 +672,56 @@ eval { require threads; threads->import(); $HAVE_THREADS = 1; };
 my $HAVE_SHARED = 0;
 if ($HAVE_THREADS) { eval { require threads::shared; threads::shared->import(); $HAVE_SHARED = 1; }; }
 
+# =============================================================================
+# WATCHDOG (cs_rc_26.10.13, Gea) -- a worker blocked in a SYSTEM CALL must not hang forever
+# =============================================================================
+# Found 2026.10.12/13 on OpenZFS on Windows (zfswin-2.4.4rc4, pool inpool): the first 1 MB write after
+# "zfs set sync=always" never returned (thread in Wait/Executive, 0 CPU, 0 pool I/O).  The run stayed
+# "running" for 9+ hours and left benchmark.running and the scratch dataset behind.  No Perl timeout can
+# interrupt a blocked syswrite(), so a separate thread watches a shared deadline which the main thread
+# re-arms before every step (phase duration + grace).  When the deadline passes it writes the result to
+# the log (BENCH_DONE error), removes the marker and ends the process with POSIX::_exit -- NOT through
+# the END block, because rm_media()'s "zfs destroy" would block the same way.  The scratch dataset is
+# then NOT destroyed; the log names it ("zfs destroy -rf ...", after the hang is cleared).
+# watchdog=<seconds> = grace on top of each step (default 300: a slow pool may need minutes to flush
+# the dirty data of the test file), watchdog=0 switches it off.  wdtest=yes = deliberate hang (self-test).
+my $WD_GRACE = (defined $P{watchdog} && $P{watchdog} =~ /^\d+$/) ? $P{watchdog} : 300;
+my ($WD_UNTIL, $WD_WHAT, $WD_DS, $WD_FIN, $WD_STOP);   # shared between main thread and watchdog thread
+if ($HAVE_SHARED) {
+    &threads::shared::share(\$WD_UNTIL); &threads::shared::share(\$WD_WHAT); &threads::shared::share(\$WD_DS);
+    &threads::shared::share(\$WD_FIN);   &threads::shared::share(\$WD_STOP);
+}
+($WD_UNTIL, $WD_WHAT, $WD_DS, $WD_FIN, $WD_STOP) = (0, '', '', 0, 0);   # WD_FIN: 0 running, 1 done ok, 2 error end
+my ($WD_ON, $WD_THR) = (0, undef);
+sub wd_arm { my ($what, $secs) = @_; return unless $WD_ON; $WD_WHAT = $what; $WD_UNTIL = time() + $secs; }
+sub wd_start {
+    return if $WD_GRACE <= 0;
+    if (!$HAVE_THREADS || !$HAVE_SHARED) { blog('bench_note: watchdog off -- needs threads + threads::shared'); return; }
+    $WD_ON = 1;
+    wd_arm('startup', $WD_GRACE);
+    my ($log, $runm, $cancel, $grace) = ($LOG, $RUNM, $CANCEL, $WD_GRACE);
+    $WD_THR = threads->create(sub {
+        while (1) {
+            select(undef, undef, undef, 0.25);
+            return if $WD_STOP;
+            my $u = $WD_UNTIL;
+            next if !$u || time() < $u;
+            if (open(my $lf, '>>', $log)) {
+                print $lf "bench_note: WATCHDOG -- no progress in '$WD_WHAT' (grace ${grace}s): the worker is blocked in a system call (driver/storage hang, pool idle?)\n";
+                print $lf "bench_note: scratch dataset $WD_DS was NOT destroyed -- after the hang is cleared: zfs destroy -rf $WD_DS\n" if $WD_DS =~ /\S/;
+                if ($WD_FIN != 1) {      # BENCH_DONE ok is already in the log when only the cleanup hung
+                    print $lf "RESULT bench_hang                = $WD_WHAT\n";
+                    print $lf "BENCH_DONE error hang in '$WD_WHAT' (watchdog)\n";
+                }
+                close $lf;
+            }
+            unlink $runm; unlink $cancel;
+            POSIX::_exit(3);
+        }
+    });
+}
+sub wd_stop { return unless $WD_THR; $WD_STOP = 1; $WD_THR->join; $WD_THR = undef; }
+
 # ---- coarse, mergeable latency histogram (microseconds) ---------------------
 # 12 buckets (cs_26.09.19.11: 50 and 100 us added so NVMe/SSD latencies are told apart
 # from HDD; p50/p99 are reported as the UPPER bound of the bucket, "100" = <= 100 us)
@@ -769,6 +819,7 @@ sub _meas {
     my $cap = $a{cap} // (16 * 1048576);
     my $bs  = $a{bs}  // 4096;
     my $dur = $a{dur} // 5;
+    wd_arm("phase $a{kind} bs=$bs", $dur + $WD_GRACE);     # watchdog: this step must end within duration + grace
 
     my @th;
     my $q = $a{seq} ? 1 : 0;
@@ -791,6 +842,7 @@ sub _meas {
         hist_merge($h, $r[4]) if ref $r[4] eq 'ARRAY';
     }
     $el = 0.001 if $el <= 0;
+    wd_arm('between phases', $WD_GRACE);
     return {
         n     => $n,
         mb    => $bytes / 1048576,
@@ -854,8 +906,10 @@ sub make_testfile {
     my $blk = 'A' x $bs;
     my $t0 = time();
     my $w = 0;
+    wd_arm('create test file', $WD_GRACE + $mb);           # watchdog: assume at least ~1 MB/s
     for (1 .. $mb) { $w += syswrite($fh, $blk) // 0; }
     close $fh;
+    wd_arm('between phases', $WD_GRACE);
     my $dt = time() - $t0;
     $dt = 0.001 if $dt <= 0;
     return ($w / 1048576) / $dt;
@@ -962,6 +1016,7 @@ sub steady_run {
     my ($label, $file, $cap, $dur_s, $iv, $nw, $nr) = @_;
     my $bs = 1048576;
     my $nwin = int($dur_s / $iv); $nwin = 1 if $nwin < 1;
+    wd_arm("steady $label", $dur_s + $WD_GRACE);
     if (!$HAVE_THREADS || !$HAVE_SHARED) {
         if ($label eq 'single' && $nr == 0) {        # serial fallback: the old inline loop, no live lines
             my ($med, $wins, $avg) = steady_write($file, $cap, $dur_s, $iv, $bs);
@@ -1045,17 +1100,30 @@ if (-f $RUNM) {
     print "already running ($who)\n";
     exit 0;
 }
-my $DONE = 0;
-my $T0   = time();
+my $DONE  = 0;
+my $OWNER = 0;          # 1 once THIS process wrote the marker.  END blocks are registered at compile time, so
+                        # without this a second start ("already running" -> exit 0 above) ran the END block and
+                        # deleted the marker of the run that is really running (found 2026.10.13)
+my $T0    = time();
 END {
+  if ($OWNER) {
+    $WD_FIN = $DONE ? 1 : 2;                       # tell the watchdog what to write if the cleanup hangs
+    wd_arm('cleanup (zfs destroy)', 120);          # a blocked "zfs destroy" must not keep the marker forever
     eval { rm_media() if $TESTDIR =~ /\S/; };
     if (!$DONE && $LOGFH) { bdone('error', 'aborted (worker exited or was cancelled)'); }
     unlink $RUNM;
     unlink $CANCEL;
+    wd_stop();
+  }
 }
-if (open(my $rf, '>', $RUNM)) { print $rf "runid=$RUNID pool=$POOL pid=$$\n"; close $rf; }
+if (open(my $rf, '>', $RUNM)) { print $rf "runid=$RUNID pool=$POOL pid=$$\n"; close $rf; $OWNER = 1; }
 
 bench_open();
+wd_start();
+if (($P{wdtest} // '') =~ /^y/i) {                 # self-test: block here on purpose, the watchdog must end the run
+    wd_arm('wdtest (deliberate hang)', $WD_GRACE);
+    sleep 3600;
+}
 
 # =============================================================================
 # HEADER -- everything that makes this run reproducible/comparable
@@ -1126,6 +1194,8 @@ if ($CHECK) {
 }
 
 mk_media('standard');
+$WD_DS = $DS if $DS =~ /\S/;                       # watchdog: name of the scratch dataset for its log note
+wd_arm('between phases', $WD_GRACE);
 
 my $FREE_MB = _free_mb($TESTDIR =~ /\S/ ? $TESTDIR : '.');
 my $want_mb = int($RAM_GB * 1024 * $SIZE_PCT / 100);
@@ -1175,6 +1245,7 @@ sub mixed_phase {
     my ($aggR, $aggW) = (new_hist(), new_hist());
     my ($nR, $bR, $eR, $nW, $bW, $eW) = (0, 0, 0, 0, 0, 0);
     my (@R, @W);
+    wd_arm('phase concurrent read+write', ($a{dur} // 15) + $WD_GRACE);
     if ($HAVE_THREADS) {
         for (1 .. $a{nread})  { my ($f, $d, $b) = ($a{file}, $a{dur}, $a{bs});
                                 push @R, threads->create(sub { _worker_read($f, $d, $b) }); }
@@ -1192,6 +1263,7 @@ sub mixed_phase {
                      hist_merge($aggW, $x[4]) if ref $x[4] eq 'ARRAY'; }
     $eR = 0.001 if $eR <= 0;
     $eW = 0.001 if $eW <= 0;
+    wd_arm('between phases', $WD_GRACE);
     return ({ iops => $nR / $eR, mbs => ($bR / 1048576) / $eR, p99 => hist_pct($aggR, 99) },
             { iops => $nW / $eW, mbs => ($bW / 1048576) / $eW, p99 => hist_pct($aggW, 99) });
 }
