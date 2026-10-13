@@ -121,7 +121,7 @@ Windows (measured 2026.09.18, OpenZFS on Windows zfswin-2.4.1rc15)
     (whose backslash escaping left the test files behind on Windows).
 
 Usage
-  perl benchmark_worker.pl profile=quick pool=tank
+  perl benchmark_worker.pl profile=basic pool=tank
   perl benchmark_worker.pl profile=mailserver syncwrite=yes load=balanced
   perl benchmark_worker.pl profile=quick pool=tank conc1=yes   # add the concurrent 1+1 phase
   perl benchmark_worker.pl name_of_run profile=basic steady=yes steady_min=30
