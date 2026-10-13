@@ -93,7 +93,9 @@
 #   * REMOTE TESTS (cs_rc_26.10.13.10, Gea): remotepath=<mounted SMB/NFS/S3 path> (Windows N:, Linux
 #     /mnt/smb, /mnt/rclone-s3 ...; the mount must exist BEFORE the start).  After the pool tests the same
 #     Perl I/O runs on that path: seq write/read, 4k QD1 read/write with p50/p99, open/close round trip
-#     (all profiles except steadywrite) and, from basic up, QD 4/16, 64K blocks and metadata ops.
+#     (all profiles except steadywrite) and, from basic up, multiuser read 1 vs N streams and concurrent
+#     read+write (same switches multiuser=/mixed=/conc1= as the pool tests; the N streams are threads on ONE
+#     mount = one SMB session), QD16, 64K blocks and metadata ops.
 #     remote_filesize=<MB> (default: quick 2048 MB, otherwise 100% of the local RAM, max 50% of the free
 #     space).  RESULT remote_* / perl_ceiling_*; the worker only touches <remotepath>/csbench_<runid>.
 # =============================================================================
@@ -1319,7 +1321,7 @@ sub remote_run {
     }
     $R->('remote_create_mbs', sprintf('%.1f', $cmbs), 'MB/s (first write of the test file, 1 stream)');
 
-    my ($r, $cpu);
+    my ($r, $cpu, $r4k);
     if (($C{sw} // 0) > 0 && !cancel_requested()) {
         ($r, $cpu) = rphase(kind => 'write', file => $file, dur => $C{sw}, bs => 1048576, streams => 1, cap => $bytes);
         $R->('remote_seq_write_mbs',     sprintf('%.1f', $r->{mbs}), 'MB/s');
@@ -1332,6 +1334,7 @@ sub remote_run {
     }
     if (($C{p4k} // 0) > 0 && !cancel_requested()) {
         ($r, $cpu) = rphase(kind => 'read', file => $file, dur => $C{p4k}, bs => 4096, streams => 1);
+        $r4k = $r;                                   # the 1-stream value of the multiuser read below
         $R->('remote_4k_read_iops',    sprintf('%.0f', $r->{iops}), 'iop/s (QD1)');
         $R->('remote_4k_read_p50_ms',  sprintf('%.2f', $r->{p50} / 1000), 'ms');
         $R->('remote_4k_read_p99_ms',  sprintf('%.2f', $r->{p99} / 1000), 'ms');
@@ -1352,15 +1355,42 @@ sub remote_run {
 
     # from basic up: parallelism, block size and metadata (quick stays quick)
     if ($PROFILE ne 'quick') {
-        if ($HAVE_THREADS) {
-            for my $q (4, 16) {
-                last if cancel_requested();
-                $r = _meas(kind => 'read', file => $file, dur => 8, bs => 4096, streams => $q);
-                $R->("remote_qd${q}_iops",   sprintf('%.0f', $r->{iops}), "iop/s (4k read, $q streams)");
-                $R->("remote_qd${q}_p99_ms", sprintf('%.2f', $r->{p99} / 1000), 'ms');
+        # multiuser read: 4k, 1 vs N streams (N = streams, as in the pool tests; multiuser=no switches it off).  The
+        # 1-stream value is the QD1 read above.  The N streams are THREADS on ONE mount = one SMB session / connection,
+        # not N separate clients.
+        if ($T_MULTI && !cancel_requested()) {
+            if ($HAVE_THREADS && $STREAMS >= 2) {
+                my $r1 = $r4k // _meas(kind => 'read', file => $file, dur => $C{mu}, bs => 4096, streams => 1);
+                my $rn = _meas(kind => 'read', file => $file, dur => $C{mu}, bs => 4096, streams => $STREAMS);
+                $R->('remote_multiuser_read_1_mbs',           sprintf('%.1f', $r1->{mbs}), 'MB/s');
+                $R->("remote_multiuser_read_${STREAMS}_mbs",  sprintf('%.1f', $rn->{mbs}), 'MB/s');
+                $R->("remote_multiuser_read_${STREAMS}_iops", sprintf('%.0f', $rn->{iops}), 'iop/s');
+                $R->('remote_multiuser_read_ratio', sprintf('%.2f', $r1->{mbs} > 0 ? $rn->{mbs} / $r1->{mbs} : 0),
+                     "x (1 -> $STREAMS streams, one SMB session)");
+            } else {
+                blog('bench_note: remote multiuser read not run -- needs threads and streams >= 2');
             }
-        } else {
-            blog('bench_note: QD 4/16 not run -- no threads');
+        }
+        # concurrent read+write on the same file, as in the pool tests: 1+1 only where the pool tests run it
+        # (database/fileserver/individual, conc1=yes), N+N always; mixed=no switches it off
+        if ($T_MIXED && !cancel_requested()) {
+            my @cfgs = ();
+            push @cfgs, ['conc',  1]        if $T_CONC1;
+            push @cfgs, ['conc5', $STREAMS] if $STREAMS >= 2;
+            for my $cfg (@cfgs) {
+                my ($pfx, $n) = @$cfg;
+                last if cancel_requested();
+                my ($rr, $ww) = mixed_phase(file => $file, dur => $C{mx}, bs => 4096, cap => $bytes, nread => $n, nwrite => $n);
+                $R->("remote_${pfx}_read_mbs",      sprintf('%.1f', $rr->{mbs}), "MB/s ($n streams)");
+                $R->("remote_${pfx}_write_mbs",     sprintf('%.1f', $ww->{mbs}), "MB/s ($n streams)");
+                $R->("remote_${pfx}_read_p99_ms",   sprintf('%.2f', $rr->{p99} / 1000), 'ms');
+                $R->("remote_${pfx}_write_p99_ms",  sprintf('%.2f', $ww->{p99} / 1000), 'ms');
+            }
+        }
+        if ($HAVE_THREADS && !cancel_requested()) {
+            $r = _meas(kind => 'read', file => $file, dur => 8, bs => 4096, streams => 16);
+            $R->('remote_qd16_iops',   sprintf('%.0f', $r->{iops}), 'iop/s (4k read, 16 streams)');
+            $R->('remote_qd16_p99_ms', sprintf('%.2f', $r->{p99} / 1000), 'ms');
         }
         if (!cancel_requested()) {
             $r = _meas(kind => 'read', file => $file, dur => 8, bs => 65536, streams => 1, seq => 1);

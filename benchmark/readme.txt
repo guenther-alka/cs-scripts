@@ -150,10 +150,14 @@ Remote tests (SMB / NFS / S3) -- remotepath=
                       I/O runs on that path (not in profile steadywrite):
                         seq write/read (1 MB) with client CPU %, 4k random read/write QD1 with p50/p99,
                         open/close round trip, perl_ceiling (what Perl itself can do per stream);
-                        from profile basic up also QD 4/16, 64K blocks and metadata (create/stat/readdir/delete).
+                        from profile basic up also multiuser read 1 vs N streams, concurrent read+write (N+N; same switches
+                        multiuser=/mixed=/conc1= as the pool tests), QD16, 64K blocks and metadata ops.
                       RESULT remote_* and perl_ceiling_*; header remotepath / remote_proto (protocol, SMB dialect;
                       on Windows the dialect needs an elevated worker).  Only <remotepath>/csbench_<runid> is
                       written and it is removed again.
+                      The N streams are threads on ONE mount = one SMB session, not N separate clients; a real
+                      multi-client test needs the worker started on several machines at the same time (see
+                      howto.ai/benchmark.info section 13 of the napp-it CS distribution: limits and proposal).
   remote_filesize=<MB>  test file size.  Default: profile quick 2048 MB (fast; reads may be served from cache,
                       the write values are the meaningful ones), every other profile 100% of the LOCAL RAM, never
                       more than 50% of the free space.  A remote SERVER with more RAM keeps part of the file in
